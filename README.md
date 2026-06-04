@@ -59,10 +59,25 @@ links the system **libdav1d**:
 If libdav1d is unavailable, drop the `avif-native` feature from `src-tauri/Cargo.toml`; the app
 still builds and AVIF files simply show a broken-thumbnail placeholder.
 
+## Keyboard shortcuts
+
+**Thumbnail grid** (when the fullscreen viewer is closed):
+
+| Key | Action |
+| :-- | :-- |
+| `←` `→` | Move selection by one |
+| `↑` `↓` | Move selection by one row |
+| `PageUp` `PageDown` | Move selection by one page |
+| `Home` `End` | First / last image |
+| `Enter` / `F` | Open the selected image fullscreen |
+
+**Fullscreen viewer:** `←` `→` navigate, `Home` `End` jump to first/last, `Esc` closes.
+The selected tile always scrolls into view as you move.
+
 ## Roadmap
 
 - [x] Wire the UI to real directories and archives
 - [x] Background thumbnail decode + on-disk cache
 - [x] AVIF decode (enable the `avif-native` feature)
-- [ ] Keyboard-first navigation polish
+- [x] Keyboard-first navigation polish
 - [ ] (later) batch export / convert module

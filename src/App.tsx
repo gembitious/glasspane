@@ -446,6 +446,77 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [viewerIndex, items.length]);
 
+  // keep a grid index visible by nudging the scroll container
+  const scrollIndexIntoView = useCallback(
+    (index: number) => {
+      const el = gridRef.current;
+      if (!el) return;
+      const top = GAP + Math.floor(index / cols) * (cellH + GAP);
+      if (top < el.scrollTop) el.scrollTop = top - GAP;
+      else if (top + cellH > el.scrollTop + el.clientHeight)
+        el.scrollTop = top + cellH - el.clientHeight + GAP;
+      setScrollTop(el.scrollTop);
+    },
+    [cols, cellH],
+  );
+
+  // grid keyboard navigation (active only when the fullscreen viewer is closed)
+  useEffect(() => {
+    if (viewerIndex !== null || items.length === 0) return;
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (document.activeElement?.tagName ?? "").toLowerCase();
+      if (tag === "input" || tag === "textarea") return;
+
+      const cur = selectedItemId ? items.findIndex((it) => it.id === selectedItemId) : -1;
+      const pageRows = Math.max(1, Math.floor(viewport.h / (cellH + GAP)));
+      const last = items.length - 1;
+      const clamp = (n: number) => Math.max(0, Math.min(last, n));
+      let next = cur;
+
+      switch (e.key) {
+        case "ArrowRight":
+          next = cur < 0 ? 0 : clamp(cur + 1);
+          break;
+        case "ArrowLeft":
+          next = cur < 0 ? 0 : clamp(cur - 1);
+          break;
+        case "ArrowDown":
+          next = cur < 0 ? 0 : clamp(cur + cols);
+          break;
+        case "ArrowUp":
+          next = cur < 0 ? 0 : clamp(cur - cols);
+          break;
+        case "Home":
+          next = 0;
+          break;
+        case "End":
+          next = last;
+          break;
+        case "PageDown":
+          next = cur < 0 ? 0 : clamp(cur + pageRows * cols);
+          break;
+        case "PageUp":
+          next = cur < 0 ? 0 : clamp(cur - pageRows * cols);
+          break;
+        case "Enter":
+        case "f":
+        case "F":
+          if (cur >= 0) {
+            e.preventDefault();
+            openViewer(items[cur].id);
+          }
+          return;
+        default:
+          return;
+      }
+      e.preventDefault();
+      setSelectedItemId(items[next].id);
+      scrollIndexIntoView(next);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [viewerIndex, items, selectedItemId, cols, cellH, viewport.h, openViewer, scrollIndexIntoView]);
+
   // -------------------------------------------------------------------------
   // Tree interactions
   // -------------------------------------------------------------------------
