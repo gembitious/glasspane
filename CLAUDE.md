@@ -49,7 +49,7 @@ It's built to fit one user's workflow — favor sharp, fast, focused behavior ov
 - **Frontend:** React + TypeScript + Vite
 - **Desktop shell + backend:** Tauri 2 (Rust)
 - **Image decode:** [`image`](https://crates.io/crates/image) crate — WebP is pure-Rust; AVIF
-  via the `avif-decoder` feature (pulls **libdav1d**, deferred — see §10).
+  via the `avif-native` feature (pulls **libdav1d**, a C lib — now **enabled**, see §10).
 - **Archives:** [`zip`](https://crates.io/crates/zip) crate — reads entries without extracting.
 - **Folder picker:** `tauri-plugin-dialog`.
 - **(optional) persist last folder:** `tauri-plugin-store`.
@@ -74,9 +74,9 @@ Three artifacts already exist (provided in the repo by the user), **not yet wire
 
 Also provided: `README.md` and `.gitignore` for the repo root.
 
-**Done:** architecture decided; prototype, backend module, and bridge written.
-**Not done:** the real project scaffold, wiring the UI to the backend ("**v3**", §9), AVIF,
-packaging.
+**Done:** architecture decided; prototype, backend module, and bridge written; project
+scaffolded; UI wired to the backend ("**v3**", §9); AVIF decode enabled (`avif-native`).
+**Not done:** packaging.
 
 ---
 
@@ -151,13 +151,16 @@ packaging.
 
 ```toml
 serde = { version = "1", features = ["derive"] }
-image = { version = "0.25" }            # add features = ["avif-decoder"] LATER for AVIF (pulls libdav1d, a C lib)
+image = { version = "0.25", features = ["avif-native"] }   # avif-native = AVIF decode via libdav1d (system C lib)
 zip = "2"
 tauri-plugin-dialog = "2"               # native folder picker
 ```
 
-> `imaging.rs` builds fine without `avif-decoder`: WebP/JPEG/PNG/GIF work; AVIF sources just
-> error gracefully (broken-thumbnail placeholder) until the feature is enabled.
+> The decode feature is **`avif-native`** (not `avif-decoder`); it pulls the `dav1d` crate,
+> which links the system **libdav1d** via pkg-config (build dep: `libdav1d-dev` on Debian/
+> Ubuntu, `brew install dav1d` on macOS, vcpkg on Windows). Without it `imaging.rs` still
+> builds — WebP/JPEG/PNG/GIF work and AVIF sources just error gracefully (broken-thumbnail
+> placeholder) — so the feature can be dropped if a target lacks libdav1d.
 
 ### 7.2 `src-tauri/src/lib.rs`
 
@@ -279,8 +282,10 @@ Each task has an acceptance criterion (AC).
 - **Tauri 2.x API:** confirm the `register_asynchronous_uri_scheme_protocol` closure shape
   (`|ctx, request, responder|` → `responder.respond(http::Response…)`) against the installed
   Tauri version; adjust if it differs.
-- **AVIF:** start **without** the `avif-decoder` feature so the project builds with zero C deps.
-  Enable it later (macOS: `brew install dav1d` + pkg-config; Windows: vcpkg).
+- **AVIF:** **enabled** via the `avif-native` feature (links system **libdav1d** through
+  pkg-config). Build dep per OS: Debian/Ubuntu `libdav1d-dev`; macOS `brew install dav1d`;
+  Windows vcpkg. Confirmed building against libdav1d 1.4.1. Drop the feature if a target lacks
+  libdav1d (AVIF then falls back to a broken-thumbnail placeholder).
 - **CSP:** must include the `imgsrv` scheme in `img-src` and the Google-Fonts hosts, or images
   and fonts silently fail to load.
 - **Protocol origin differs per platform** — handled in `viewerApi.ts` via a UA check; don't
@@ -296,7 +301,7 @@ Each task has an acceptance criterion (AC).
 
 ## 11. Roadmap (after v3)
 
-- Enable AVIF decode (`avif-decoder` + libdav1d).
+- ~~Enable AVIF decode (`avif-native` + libdav1d).~~ **Done.**
 - **Batch export / convert module** (deferred): right-click a selection / folder / zip → convert
   to jpg/png/webp. Implement decode→encode in Rust. _(The user has an existing PyQt WebP→JPG
   converter whose logic and UX are a useful reference, but here it's reimplemented in Rust.)_

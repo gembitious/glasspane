@@ -21,6 +21,6 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-image = { version = "0.25" }            # add features = ["avif-decoder"] LATER for AVIF (pulls libdav1d, a C lib)
+image = { version = "0.25", features = ["avif-native"] }   # avif-native = AVIF decode via libdav1d (system C lib)
 zip = "2"
 tauri-plugin-dialog = "2"               # native folder picker

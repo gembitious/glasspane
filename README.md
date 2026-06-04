@@ -16,7 +16,7 @@ Early development. The interactive UX prototype is in place; backend wiring
 
 - Frontend: React + TypeScript + Vite
 - Backend: Rust (Tauri 2)
-- Image decode: [`image`](https://crates.io/crates/image) (WebP is pure-Rust; AVIF via the `avif-decoder` feature / libdav1d)
+- Image decode: [`image`](https://crates.io/crates/image) (WebP is pure-Rust; AVIF via the `avif-native` feature / libdav1d)
 - Archives: [`zip`](https://crates.io/crates/zip) (reads entries without extracting)
 
 ## Architecture
@@ -47,10 +47,22 @@ npm run tauri dev      # run the desktop app in dev mode
 npm run tauri build    # produce a release binary
 ```
 
+### Prerequisites
+
+Besides the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/), AVIF decoding
+links the system **libdav1d**:
+
+- Debian/Ubuntu: `sudo apt install libdav1d-dev`
+- macOS: `brew install dav1d`
+- Windows: install `dav1d` via vcpkg
+
+If libdav1d is unavailable, drop the `avif-native` feature from `src-tauri/Cargo.toml`; the app
+still builds and AVIF files simply show a broken-thumbnail placeholder.
+
 ## Roadmap
 
-- [ ] Wire the UI to real directories and archives
-- [ ] Background thumbnail decode + on-disk cache
-- [ ] AVIF decode (enable the `avif-decoder` feature)
+- [x] Wire the UI to real directories and archives
+- [x] Background thumbnail decode + on-disk cache
+- [x] AVIF decode (enable the `avif-native` feature)
 - [ ] Keyboard-first navigation polish
 - [ ] (later) batch export / convert module
