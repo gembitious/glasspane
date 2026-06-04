@@ -318,3 +318,7 @@ Each task has an acceptance criterion (AC).
 - Prefer **complete-file edits** over scattered partial patches when changing a file.
 - Small, logical commits; run `npm run tauri dev` to verify each phase before moving on.
 - **Ask before** adding a new dependency or changing the §6 architecture.
+- **Branch naming:** use `<prefix>/<feature>`, where `<prefix>` is the kind of work
+  (`feat`, `fix`, `refactor`, `chore`, `docs`, …) and `<feature>` is a short kebab-case
+  description of what's being worked on — e.g. `feat/wire-backend`, `fix/thumbnail-cache-key`,
+  `docs/readme`. One branch per logical piece of work.
