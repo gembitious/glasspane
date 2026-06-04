@@ -1,11 +1,12 @@
-// glasspane — UX prototype (MOCK data).
+// glasspane — main viewer UI (Phase v3: wired to the Rust backend).
 //
-// This is the visual target described in CLAUDE.md §8: a 3-pane explorer-style
-// image viewer with a folder/zip tree, a manually virtualized thumbnail grid,
-// a collapsible preview panel, and a fullscreen viewer. Everything here runs on
-// mock data and a *simulated* async thumbnail load. Phase v3 (§9) swaps the
-// mock data for real backend calls via src/lib/viewerApi.ts — the layout and
-// interactions stay the same.
+// The 3-pane layout from the prototype (CLAUDE.md §8) now runs on real data:
+//   - a lazily-loaded folder/zip tree (list_dir)
+//   - a manually virtualized thumbnail grid backed by the imgsrv:// protocol
+//   - a preview panel with real metadata (image_meta) and the full image
+//   - a fullscreen viewer (fullUrl) with keyboard navigation
+//
+// Backend contracts live in src/lib/viewerApi.ts (kept in sync with imaging.rs).
 
 import {
   useCallback,
@@ -16,6 +17,16 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import {
+  listDir,
+  listArchive,
+  imageMeta,
+  thumbUrl,
+  fullUrl,
+  type DirEntry,
+  type ImageMeta,
+} from "./lib/viewerApi";
 import "./App.css";
 
 // ---------------------------------------------------------------------------
@@ -38,112 +49,66 @@ const C = {
   badge: "#2a323d",
   skeleton: "#1b2027",
   ring: "#4c9aff",
+  danger: "#ef6a6a",
 };
 
 const MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, monospace';
 
 // ---------------------------------------------------------------------------
-// Mock model
+// Model
 // ---------------------------------------------------------------------------
 
-type Fmt = "webp" | "avif" | "jpg" | "png" | "gif";
 type NodeKind = "dir" | "archive";
-
-interface TreeNode {
-  id: string;
-  name: string;
-  kind: NodeKind;
-  count: number;
-  children?: TreeNode[];
-}
-
-interface GridItem {
-  id: string;
-  name: string;
-  fmt: Fmt;
-  size: number; // bytes
-  w: number;
-  h: number;
-}
-
 type SortKey = "name" | "format" | "size";
 type ThumbSizeKey = "S" | "M" | "L";
 
+/** A grid item — a superset of viewerApi's ImgRef plus UI-only fields. */
+interface Item {
+  id: string;
+  name: string;
+  path: string;
+  archive?: string;
+  fmt: string;
+}
+
 const TILE: Record<ThumbSizeKey, number> = { S: 120, M: 168, L: 232 };
+const THUMB_W: Record<ThumbSizeKey, number> = { S: 192, M: 256, L: 384 };
 const GAP = 12;
 const LABEL_H = 34;
 const OVERSCAN_ROWS = 3;
 
-const ALL_FORMATS: Fmt[] = ["webp", "avif", "jpg", "png", "gif"];
+// Known formats that get filter chips; anything else always shows.
+const KNOWN_FORMATS = ["webp", "avif", "jpg", "png", "gif"] as const;
+type KnownFormat = (typeof KNOWN_FORMATS)[number];
+
+// Size-sort fetches metadata lazily; above this many items it's skipped to
+// avoid decoding a whole huge directory just to sort (see CLAUDE.md §10).
+const SIZE_SORT_LIMIT = 4000;
+
+const ROOT_KEY = "glasspane.root";
 
 // ---------------------------------------------------------------------------
-// Mock data
+// Path / format helpers
 // ---------------------------------------------------------------------------
 
-const TREE: TreeNode[] = [
-  {
-    id: "root",
-    name: "D:\\images",
-    kind: "dir",
-    count: 0,
-    children: [
-      { id: "wallpapers", name: "wallpapers", kind: "dir", count: 248 },
-      {
-        id: "photos",
-        name: "photos",
-        kind: "dir",
-        count: 0,
-        children: [
-          { id: "photos-2024", name: "2024", kind: "dir", count: 1320 },
-          { id: "photos-2025", name: "2025", kind: "dir", count: 642 },
-        ],
-      },
-      { id: "manga.cbz", name: "one-shot.cbz", kind: "archive", count: 38 },
-      { id: "screens.zip", name: "screenshots.zip", kind: "archive", count: 510 },
-      { id: "renders", name: "renders", kind: "dir", count: 87 },
-    ],
-  },
-];
-
-const FORMAT_POOL: Fmt[] = ["webp", "avif", "webp", "jpg", "png", "webp", "avif", "gif"];
-
-// deterministic pseudo-random from a string seed
-function seedFrom(s: string): number {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
+function sepOf(p: string): string {
+  return p.includes("\\") ? "\\" : "/";
 }
 
-function mockItems(node: TreeNode | null): GridItem[] {
-  if (!node || node.count <= 0) return [];
-  const items: GridItem[] = [];
-  const base = seedFrom(node.id);
-  for (let i = 0; i < node.count; i++) {
-    const r = seedFrom(`${node.id}:${i}`);
-    const fmt = FORMAT_POOL[(base + i) % FORMAT_POOL.length];
-    const w = 640 + (r % 7) * 160;
-    const h = 480 + ((r >> 3) % 6) * 200;
-    const size = 80_000 + (r % 4_000_000);
-    const name = `${node.kind === "archive" ? "page" : "img"}_${String(i + 1).padStart(4, "0")}.${fmt}`;
-    items.push({ id: `${node.id}:${i}`, name, fmt, size, w, h });
-  }
-  return items;
+function baseName(p: string): string {
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : p;
 }
 
-// a stable color pair per item, used to fake the decoded thumbnail
-function tileColors(id: string): [string, string] {
-  const r = seedFrom(id);
-  const hue = r % 360;
-  const hue2 = (hue + 40 + (r % 60)) % 360;
-  return [`hsl(${hue} 45% 32%)`, `hsl(${hue2} 50% 22%)`];
+function extOf(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
 }
 
-// ---------------------------------------------------------------------------
-// Formatting helpers
-// ---------------------------------------------------------------------------
+function fmtOf(name: string): string {
+  const e = extOf(name);
+  return e === "jpeg" ? "jpg" : e;
+}
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -157,16 +122,31 @@ function fmtBytes(n: number): string {
   return `${v.toFixed(v < 10 ? 1 : 0)} ${u[i]}`;
 }
 
-function findPath(nodes: TreeNode[], id: string, trail: TreeNode[] = []): TreeNode[] | null {
-  for (const n of nodes) {
-    const next = [...trail, n];
-    if (n.id === id) return next;
-    if (n.children) {
-      const found = findPath(n.children, id, next);
-      if (found) return found;
-    }
-  }
-  return null;
+function itemIdOf(path: string, archive?: string): string {
+  return archive ? `${archive}::${path}` : path;
+}
+
+interface Crumb {
+  name: string;
+  path: string;
+  kind: NodeKind;
+}
+
+function breadcrumb(root: string, sel: string, selKind: NodeKind): Crumb[] {
+  const sep = sepOf(root);
+  const crumbs: Crumb[] = [{ name: baseName(root) || root, path: root, kind: "dir" }];
+  if (sel === root || !sel.startsWith(root)) return crumbs;
+
+  let rest = sel.slice(root.length);
+  while (rest.startsWith(sep)) rest = rest.slice(1);
+  const segs = rest.split(sep).filter(Boolean);
+
+  let acc = root;
+  segs.forEach((s, i) => {
+    acc = acc.endsWith(sep) ? acc + s : acc + sep + s;
+    crumbs.push({ name: s, path: acc, kind: i === segs.length - 1 ? selKind : "dir" });
+  });
+  return crumbs;
 }
 
 // ===========================================================================
@@ -174,28 +154,164 @@ function findPath(nodes: TreeNode[], id: string, trail: TreeNode[] = []): TreeNo
 // ===========================================================================
 
 export default function App() {
-  const [expanded, setExpanded] = useState<Set<string>>(new Set(["root", "photos"]));
-  const [selectedNodeId, setSelectedNodeId] = useState<string>("wallpapers");
+  const [rootPath, setRootPath] = useState<string | null>(() => localStorage.getItem(ROOT_KEY));
+
+  // tree state
+  const [dirCache, setDirCache] = useState<Record<string, DirEntry[]>>({});
+  const [archiveCount, setArchiveCount] = useState<Record<string, number>>({});
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [loadingNodes, setLoadingNodes] = useState<Set<string>>(new Set());
+
+  // selection / grid
+  const [selected, setSelected] = useState<{ path: string; kind: NodeKind } | null>(null);
+  const [nodeItems, setNodeItems] = useState<Item[]>([]);
+  const [gridLoading, setGridLoading] = useState(false);
+  const [gridError, setGridError] = useState<string | null>(null);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
+
+  // toolbar
   const [thumbSize, setThumbSize] = useState<ThumbSizeKey>("M");
   const [sortKey, setSortKey] = useState<SortKey>("name");
-  const [activeFormats, setActiveFormats] = useState<Set<Fmt>>(new Set(ALL_FORMATS));
+  const [activeFormats, setActiveFormats] = useState<Set<KnownFormat>>(new Set(KNOWN_FORMATS));
   const [previewOpen, setPreviewOpen] = useState(true);
+
+  // viewer
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
 
-  const selectedNode = useMemo(() => {
-    const p = findPath(TREE, selectedNodeId);
-    return p ? p[p.length - 1] : null;
-  }, [selectedNodeId]);
+  // metadata cache (preview + size sort); null = fetched-but-failed/unknown
+  const metaRef = useRef<Record<string, ImageMeta | null>>({});
+  const [metaTick, setMetaTick] = useState(0);
 
-  const nodePath = useMemo(() => findPath(TREE, selectedNodeId) ?? [], [selectedNodeId]);
+  // thumbnail load tracking
+  const loadedRef = useRef<Set<string>>(new Set());
+  const brokenRef = useRef<Set<string>>(new Set());
+  const [loadTick, setLoadTick] = useState(0);
+  const bumpLoad = useCallback(() => setLoadTick((v) => v + 1), []);
 
-  // raw mock items for the selected node
-  const rawItems = useMemo(() => mockItems(selectedNode), [selectedNode]);
+  // -------------------------------------------------------------------------
+  // Tree loading
+  // -------------------------------------------------------------------------
 
-  // filter + sort
+  const ensureDir = useCallback(
+    async (path: string): Promise<DirEntry[]> => {
+      const cached = dirCache[path];
+      if (cached) return cached;
+      setLoadingNodes((s) => new Set(s).add(path));
+      try {
+        const entries = await listDir(path);
+        setDirCache((c) => ({ ...c, [path]: entries }));
+        return entries;
+      } finally {
+        setLoadingNodes((s) => {
+          const n = new Set(s);
+          n.delete(path);
+          return n;
+        });
+      }
+    },
+    [dirCache],
+  );
+
+  // -------------------------------------------------------------------------
+  // Open root folder
+  // -------------------------------------------------------------------------
+
+  const pickFolder = useCallback(async () => {
+    const picked = await openDialog({ directory: true, multiple: false });
+    if (typeof picked !== "string") return;
+    setRootPath(picked);
+    localStorage.setItem(ROOT_KEY, picked);
+    // reset everything tied to the previous root
+    setDirCache({});
+    setArchiveCount({});
+    setExpanded(new Set([picked]));
+    setSelected({ path: picked, kind: "dir" });
+  }, []);
+
+  // expand root + select it on first mount when a root was persisted
+  useEffect(() => {
+    if (rootPath && !selected) {
+      setExpanded((s) => new Set(s).add(rootPath));
+      setSelected({ path: rootPath, kind: "dir" });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rootPath]);
+
+  // -------------------------------------------------------------------------
+  // Grid loading on selection
+  // -------------------------------------------------------------------------
+
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+
+  useEffect(() => {
+    if (!selected) {
+      setNodeItems([]);
+      return;
+    }
+    let cancelled = false;
+    setGridLoading(true);
+    setGridError(null);
+    setSelectedItemId(null);
+    setViewerIndex(null);
+    metaRef.current = {};
+    loadedRef.current = new Set();
+    brokenRef.current = new Set();
+    if (gridRef.current) gridRef.current.scrollTop = 0;
+    setScrollTop(0);
+
+    (async () => {
+      try {
+        let items: Item[];
+        if (selected.kind === "archive") {
+          const entries = await listArchive(selected.path);
+          if (cancelled) return;
+          setArchiveCount((c) => ({ ...c, [selected.path]: entries.length }));
+          items = entries.map((e) => ({
+            id: itemIdOf(e.name, selected.path),
+            name: e.name,
+            path: e.name,
+            archive: selected.path,
+            fmt: fmtOf(e.name),
+          }));
+        } else {
+          const entries = await ensureDir(selected.path);
+          if (cancelled) return;
+          items = entries
+            .filter((e) => e.kind === "image")
+            .map((e) => ({
+              id: itemIdOf(e.path),
+              name: e.name,
+              path: e.path,
+              fmt: fmtOf(e.name),
+            }));
+        }
+        if (!cancelled) setNodeItems(items);
+      } catch (err) {
+        if (!cancelled) {
+          setGridError(String(err));
+          setNodeItems([]);
+        }
+      } finally {
+        if (!cancelled) setGridLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected]);
+
+  // -------------------------------------------------------------------------
+  // Filter + sort
+  // -------------------------------------------------------------------------
+
   const items = useMemo(() => {
-    const filtered = rawItems.filter((it) => activeFormats.has(it.fmt));
+    const filtered = nodeItems.filter((it) => {
+      const known = (KNOWN_FORMATS as readonly string[]).includes(it.fmt);
+      return known ? activeFormats.has(it.fmt as KnownFormat) : true;
+    });
     const sorted = [...filtered];
     sorted.sort((a, b) => {
       switch (sortKey) {
@@ -203,31 +319,83 @@ export default function App() {
           return a.name.localeCompare(b.name);
         case "format":
           return a.fmt.localeCompare(b.fmt) || a.name.localeCompare(b.name);
-        case "size":
-          return b.size - a.size;
+        case "size": {
+          const sa = metaRef.current[a.id]?.size ?? -1;
+          const sb = metaRef.current[b.id]?.size ?? -1;
+          return sb - sa || a.name.localeCompare(b.name);
+        }
       }
     });
     return sorted;
-  }, [rawItems, activeFormats, sortKey]);
-
-  // ----- virtualization state -----
-  const gridRef = useRef<HTMLDivElement | null>(null);
-  const [scrollTop, setScrollTop] = useState(0);
-  const [viewport, setViewport] = useState({ w: 0, h: 0 });
-
-  // reset selection + scroll when the node changes
-  useEffect(() => {
-    setSelectedItemId(null);
-    setViewerIndex(null);
-    if (gridRef.current) gridRef.current.scrollTop = 0;
-    setScrollTop(0);
-  }, [selectedNodeId]);
+    // metaTick keeps the size-sort fresh as metadata streams in
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeItems, activeFormats, sortKey, metaTick]);
 
   const selectedItem = useMemo(
     () => items.find((it) => it.id === selectedItemId) ?? null,
     [items, selectedItemId],
   );
 
+  // -------------------------------------------------------------------------
+  // Metadata fetching (lazy)
+  // -------------------------------------------------------------------------
+
+  const fetchMeta = useCallback((it: Item) => {
+    if (it.id in metaRef.current) return;
+    metaRef.current[it.id] = null; // mark in-flight to avoid duplicates
+    imageMeta(it)
+      .then((m) => {
+        metaRef.current[it.id] = m;
+      })
+      .catch(() => {
+        metaRef.current[it.id] = null;
+      })
+      .finally(() => setMetaTick((v) => v + 1));
+  }, []);
+
+  // preview metadata for the selected item
+  useEffect(() => {
+    if (selectedItem) fetchMeta(selectedItem);
+  }, [selectedItem, fetchMeta]);
+
+  // size sort: stream metadata for the whole (reasonably-sized) listing
+  useEffect(() => {
+    if (sortKey !== "size" || nodeItems.length === 0 || nodeItems.length > SIZE_SORT_LIMIT) return;
+    let cancelled = false;
+    const queue = nodeItems.filter((it) => !(it.id in metaRef.current));
+    let i = 0;
+    let active = 0;
+
+    const pump = () => {
+      while (!cancelled && active < 6 && i < queue.length) {
+        const it = queue[i++];
+        active++;
+        metaRef.current[it.id] = null;
+        imageMeta(it)
+          .then((m) => {
+            if (!cancelled) metaRef.current[it.id] = m;
+          })
+          .catch(() => {})
+          .finally(() => {
+            active--;
+            if (!cancelled) {
+              setMetaTick((v) => v + 1);
+              pump();
+            }
+          });
+      }
+    };
+    pump();
+    return () => {
+      cancelled = true;
+    };
+  }, [sortKey, nodeItems]);
+
+  // -------------------------------------------------------------------------
+  // Virtualization
+  // -------------------------------------------------------------------------
+
+  const [viewport, setViewport] = useState({ w: 0, h: 0 });
   useEffect(() => {
     const el = gridRef.current;
     if (!el) return;
@@ -239,6 +407,7 @@ export default function App() {
   }, []);
 
   const tile = TILE[thumbSize];
+  const thumbW = THUMB_W[thumbSize];
   const cellH = tile + LABEL_H;
   const cols = Math.max(1, Math.floor((viewport.w - GAP) / (tile + GAP)));
   const rows = Math.ceil(items.length / cols);
@@ -250,25 +419,10 @@ export default function App() {
   const lastIdx = Math.min(items.length, (firstRow + visibleRows) * cols);
   const visible = items.slice(firstIdx, lastIdx);
 
-  // ----- simulated thumbnail load (replaced by real <img> onLoad in v3) -----
-  const loadedRef = useRef<Set<string>>(new Set());
-  const [, setLoadTick] = useState(0);
-  useEffect(() => {
-    const timers: number[] = [];
-    for (const it of visible) {
-      if (loadedRef.current.has(it.id)) continue;
-      const delay = 120 + (seedFrom(it.id) % 520);
-      const t = window.setTimeout(() => {
-        loadedRef.current.add(it.id);
-        setLoadTick((v) => v + 1);
-      }, delay);
-      timers.push(t);
-    }
-    return () => timers.forEach((t) => clearTimeout(t));
-    // re-run as the visible window shifts
-  }, [firstIdx, lastIdx, items]);
+  // -------------------------------------------------------------------------
+  // Fullscreen viewer + keyboard nav
+  // -------------------------------------------------------------------------
 
-  // ----- fullscreen viewer -----
   const openViewer = useCallback(
     (id: string) => {
       const idx = items.findIndex((it) => it.id === id);
@@ -292,15 +446,31 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [viewerIndex, items.length]);
 
-  const toggleExpand = (id: string) =>
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  // -------------------------------------------------------------------------
+  // Tree interactions
+  // -------------------------------------------------------------------------
 
-  const toggleFormat = (f: Fmt) =>
+  const toggleExpand = useCallback(
+    (path: string) => {
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (next.has(path)) {
+          next.delete(path);
+        } else {
+          next.add(path);
+          void ensureDir(path);
+        }
+        return next;
+      });
+    },
+    [ensureDir],
+  );
+
+  const selectNode = useCallback((path: string, kind: NodeKind) => {
+    setSelected({ path, kind });
+  }, []);
+
+  const toggleFormat = (f: KnownFormat) =>
     setActiveFormats((prev) => {
       const next = new Set(prev);
       if (next.has(f)) next.delete(f);
@@ -308,17 +478,28 @@ export default function App() {
       return next;
     });
 
+  const crumbs = useMemo(
+    () => (rootPath && selected ? breadcrumb(rootPath, selected.path, selected.kind) : []),
+    [rootPath, selected],
+  );
+
+  const selectedNodeName = selected ? baseName(selected.path) : null;
+
   // =========================================================================
   // Render
   // =========================================================================
+
+  // touch loadTick so the grid re-renders as thumbnails load / fail
+  void loadTick;
 
   return (
     <div style={S.app}>
       <TitleBar />
 
       <Toolbar
-        nodePath={nodePath}
-        onCrumb={setSelectedNodeId}
+        crumbs={crumbs}
+        onPickFolder={pickFolder}
+        onCrumb={selectNode}
         thumbSize={thumbSize}
         setThumbSize={setThumbSize}
         sortKey={sortKey}
@@ -334,17 +515,29 @@ export default function App() {
         <aside style={S.tree}>
           <div style={S.paneHeader}>EXPLORER</div>
           <div style={{ flex: 1, overflow: "auto", padding: "4px 0" }}>
-            {TREE.map((n) => (
+            {!rootPath ? (
+              <div style={{ padding: 16, color: C.textFaint, fontSize: 12, lineHeight: 1.6 }}>
+                폴더가 열려 있지 않습니다.
+                <br />
+                <button style={{ ...S.primaryBtn, marginTop: 10 }} onClick={pickFolder}>
+                  폴더 열기
+                </button>
+              </div>
+            ) : (
               <TreeRow
-                key={n.id}
-                node={n}
+                path={rootPath}
+                name={baseName(rootPath) || rootPath}
+                kind="dir"
                 depth={0}
+                dirCache={dirCache}
+                archiveCount={archiveCount}
                 expanded={expanded}
-                toggleExpand={toggleExpand}
-                selectedNodeId={selectedNodeId}
-                onSelect={setSelectedNodeId}
+                loadingNodes={loadingNodes}
+                selectedPath={selected?.path ?? null}
+                onToggle={toggleExpand}
+                onSelect={selectNode}
               />
-            ))}
+            )}
           </div>
         </aside>
 
@@ -354,27 +547,41 @@ export default function App() {
           style={S.grid}
           onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)}
         >
-          {items.length === 0 ? (
-            <div style={S.empty}>이 위치에 표시할 이미지가 없습니다.</div>
+          {gridError ? (
+            <div style={{ ...S.empty, color: C.danger }}>불러오기 실패: {gridError}</div>
+          ) : gridLoading ? (
+            <div style={S.empty}>불러오는 중…</div>
+          ) : items.length === 0 ? (
+            <div style={S.empty}>
+              {selected ? "이 위치에 표시할 이미지가 없습니다." : "폴더 또는 zip을 선택하세요."}
+            </div>
           ) : (
             <div style={{ position: "relative", height: totalH, width: "100%" }}>
               {visible.map((it, k) => {
                 const idx = firstIdx + k;
                 const row = Math.floor(idx / cols);
                 const col = idx % cols;
-                const left = GAP + col * (tile + GAP);
-                const top = GAP + row * (cellH + GAP);
                 return (
                   <Tile
                     key={it.id}
                     item={it}
                     tile={tile}
-                    left={left}
-                    top={top}
+                    thumbW={thumbW}
+                    left={GAP + col * (tile + GAP)}
+                    top={GAP + row * (cellH + GAP)}
                     loaded={loadedRef.current.has(it.id)}
+                    broken={brokenRef.current.has(it.id)}
                     selected={it.id === selectedItemId}
                     onSelect={() => setSelectedItemId(it.id)}
                     onOpen={() => openViewer(it.id)}
+                    onLoaded={() => {
+                      loadedRef.current.add(it.id);
+                      bumpLoad();
+                    }}
+                    onBroken={() => {
+                      brokenRef.current.add(it.id);
+                      bumpLoad();
+                    }}
                   />
                 );
               })}
@@ -386,6 +593,7 @@ export default function App() {
         {previewOpen && (
           <PreviewPanel
             item={selectedItem}
+            meta={selectedItem ? metaRef.current[selectedItem.id] ?? null : null}
             onOpenFull={() => selectedItem && openViewer(selectedItem.id)}
             onClose={() => setPreviewOpen(false)}
           />
@@ -394,7 +602,7 @@ export default function App() {
 
       <StatusBar
         count={items.length}
-        node={selectedNode}
+        nodeName={selectedNodeName}
         sortKey={sortKey}
         selectedName={selectedItem?.name ?? null}
         cols={cols}
@@ -406,7 +614,7 @@ export default function App() {
           item={items[viewerIndex]}
           index={viewerIndex}
           total={items.length}
-          nodePath={nodePath}
+          crumbs={crumbs}
           onPrev={() => setViewerIndex((i) => (i === null ? i : Math.max(0, i - 1)))}
           onNext={() =>
             setViewerIndex((i) => (i === null ? i : Math.min(items.length - 1, i + 1)))
@@ -439,14 +647,15 @@ function TitleBar() {
 // ---------------------------------------------------------------------------
 
 interface ToolbarProps {
-  nodePath: TreeNode[];
-  onCrumb: (id: string) => void;
+  crumbs: Crumb[];
+  onPickFolder: () => void;
+  onCrumb: (path: string, kind: NodeKind) => void;
   thumbSize: ThumbSizeKey;
   setThumbSize: (s: ThumbSizeKey) => void;
   sortKey: SortKey;
   setSortKey: (s: SortKey) => void;
-  activeFormats: Set<Fmt>;
-  toggleFormat: (f: Fmt) => void;
+  activeFormats: Set<KnownFormat>;
+  toggleFormat: (f: KnownFormat) => void;
   previewOpen: boolean;
   setPreviewOpen: (b: boolean) => void;
 }
@@ -454,20 +663,20 @@ interface ToolbarProps {
 function Toolbar(p: ToolbarProps) {
   return (
     <div style={S.toolbarWrap}>
-      {/* row 1: actions + breadcrumb */}
       <div style={S.toolbarRow}>
-        <button style={S.primaryBtn} title="폴더를 선택해 트리 루트로 엽니다 (v3에서 연결)">
+        <button style={S.primaryBtn} onClick={p.onPickFolder} title="폴더를 선택해 트리 루트로 엽니다">
           폴더 열기
         </button>
         <div style={S.crumbs}>
-          {p.nodePath.map((n, i) => (
-            <span key={n.id} style={{ display: "inline-flex", alignItems: "center" }}>
+          {p.crumbs.map((c, i) => (
+            <span key={c.path} style={{ display: "inline-flex", alignItems: "center" }}>
               {i > 0 && <span style={{ color: C.textFaint, margin: "0 6px" }}>›</span>}
               <button
-                style={{ ...S.crumb, color: i === p.nodePath.length - 1 ? C.text : C.textDim }}
-                onClick={() => p.onCrumb(n.id)}
+                style={{ ...S.crumb, color: i === p.crumbs.length - 1 ? C.text : C.textDim }}
+                onClick={() => p.onCrumb(c.path, c.kind)}
+                title={c.path}
               >
-                {n.name}
+                {c.name}
               </button>
             </span>
           ))}
@@ -482,7 +691,6 @@ function Toolbar(p: ToolbarProps) {
         </button>
       </div>
 
-      {/* row 2: size + filter + sort */}
       <div style={{ ...S.toolbarRow, borderTop: `1px solid ${C.borderSoft}` }}>
         <span style={S.toolLabel}>크기</span>
         <div style={S.segment}>
@@ -499,10 +707,10 @@ function Toolbar(p: ToolbarProps) {
 
         <span style={{ ...S.toolLabel, marginLeft: 16 }}>형식</span>
         <div style={{ display: "flex", gap: 6 }}>
-          {ALL_FORMATS.map((f) => {
+          {KNOWN_FORMATS.map((f) => {
             const on = p.activeFormats.has(f);
-            const hl = f === "webp" ? C.webp : f === "avif" ? C.avif : C.textDim;
             const highlight = f === "webp" || f === "avif";
+            const hl = f === "webp" ? C.webp : C.avif;
             return (
               <button
                 key={f}
@@ -539,23 +747,38 @@ function Toolbar(p: ToolbarProps) {
 }
 
 // ---------------------------------------------------------------------------
-// Tree row
+// Tree row (recursive, lazily loaded)
 // ---------------------------------------------------------------------------
 
 interface TreeRowProps {
-  node: TreeNode;
+  path: string;
+  name: string;
+  kind: NodeKind;
   depth: number;
+  dirCache: Record<string, DirEntry[]>;
+  archiveCount: Record<string, number>;
   expanded: Set<string>;
-  toggleExpand: (id: string) => void;
-  selectedNodeId: string;
-  onSelect: (id: string) => void;
+  loadingNodes: Set<string>;
+  selectedPath: string | null;
+  onToggle: (path: string) => void;
+  onSelect: (path: string, kind: NodeKind) => void;
 }
 
-function TreeRow({ node, depth, expanded, toggleExpand, selectedNodeId, onSelect }: TreeRowProps) {
-  const hasChildren = !!node.children?.length;
-  const isOpen = expanded.has(node.id);
-  const isSel = node.id === selectedNodeId;
-  const icon = node.kind === "archive" ? "🗜" : isOpen ? "📂" : "📁";
+function TreeRow(props: TreeRowProps) {
+  const { path, name, kind, depth, dirCache, archiveCount, expanded, loadingNodes } = props;
+  const { selectedPath, onToggle, onSelect } = props;
+
+  const isDir = kind === "dir";
+  const isOpen = expanded.has(path);
+  const isSel = selectedPath === path;
+  const isLoading = loadingNodes.has(path);
+
+  const children = isDir ? dirCache[path]?.filter((e) => e.kind !== "image") ?? null : null;
+  const imageCount = isDir
+    ? dirCache[path]?.filter((e) => e.kind === "image").length
+    : archiveCount[path];
+
+  const icon = kind === "archive" ? "🗜" : isOpen ? "📂" : "📁";
 
   return (
     <div>
@@ -566,39 +789,52 @@ function TreeRow({ node, depth, expanded, toggleExpand, selectedNodeId, onSelect
           background: isSel ? C.accentSoft : "transparent",
           color: isSel ? C.text : C.textDim,
         }}
-        onClick={() => onSelect(node.id)}
-        onDoubleClick={() => hasChildren && toggleExpand(node.id)}
+        onClick={() => onSelect(path, kind)}
+        onDoubleClick={() => isDir && onToggle(path)}
+        title={path}
       >
         <span
           style={{ width: 14, display: "inline-block", color: C.textFaint, cursor: "pointer" }}
           onClick={(e) => {
             e.stopPropagation();
-            if (hasChildren) toggleExpand(node.id);
+            if (isDir) onToggle(path);
           }}
         >
-          {hasChildren ? (isOpen ? "▾" : "▸") : ""}
+          {isDir ? (isOpen ? "▾" : "▸") : ""}
         </span>
         <span style={{ marginRight: 6 }}>{icon}</span>
-        <span
-          style={{ flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
-        >
-          {node.name}
+        <span style={{ flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+          {name}
         </span>
-        {node.count > 0 && <span style={S.treeCount}>{node.count}</span>}
+        {isLoading ? (
+          <span style={S.treeCount}>…</span>
+        ) : (
+          imageCount !== undefined && imageCount > 0 && <span style={S.treeCount}>{imageCount}</span>
+        )}
       </div>
-      {hasChildren && isOpen && (
+
+      {isDir && isOpen && children && (
         <div>
-          {node.children!.map((c) => (
-            <TreeRow
-              key={c.id}
-              node={c}
-              depth={depth + 1}
-              expanded={expanded}
-              toggleExpand={toggleExpand}
-              selectedNodeId={selectedNodeId}
-              onSelect={onSelect}
-            />
-          ))}
+          {children.length === 0 ? (
+            <div style={{ ...S.treeEmpty, paddingLeft: 8 + (depth + 1) * 14 }}>비어 있음</div>
+          ) : (
+            children.map((c) => (
+              <TreeRow
+                key={c.path}
+                path={c.path}
+                name={c.name}
+                kind={c.kind === "archive" ? "archive" : "dir"}
+                depth={depth + 1}
+                dirCache={dirCache}
+                archiveCount={archiveCount}
+                expanded={expanded}
+                loadingNodes={loadingNodes}
+                selectedPath={selectedPath}
+                onToggle={onToggle}
+                onSelect={onSelect}
+              />
+            ))
+          )}
         </div>
       )}
     </div>
@@ -606,27 +842,31 @@ function TreeRow({ node, depth, expanded, toggleExpand, selectedNodeId, onSelect
 }
 
 // ---------------------------------------------------------------------------
-// Grid tile
+// Grid tile (real thumbnail via imgsrv)
 // ---------------------------------------------------------------------------
 
 interface TileProps {
-  item: GridItem;
+  item: Item;
   tile: number;
+  thumbW: number;
   left: number;
   top: number;
   loaded: boolean;
+  broken: boolean;
   selected: boolean;
   onSelect: () => void;
   onOpen: () => void;
+  onLoaded: () => void;
+  onBroken: () => void;
 }
 
-function Tile({ item, tile, left, top, loaded, selected, onSelect, onOpen }: TileProps) {
-  const [ca, cb] = tileColors(item.id);
+function Tile(p: TileProps) {
+  const { item, tile, thumbW, left, top, loaded, broken, selected } = p;
   return (
     <div
       style={{ position: "absolute", left, top, width: tile, height: tile + LABEL_H }}
-      onClick={onSelect}
-      onDoubleClick={onOpen}
+      onClick={p.onSelect}
+      onDoubleClick={p.onOpen}
     >
       <div
         style={{
@@ -641,30 +881,30 @@ function Tile({ item, tile, left, top, loaded, selected, onSelect, onOpen }: Til
           boxShadow: selected ? `0 0 0 4px ${C.accentSoft}` : "none",
         }}
       >
-        {/* simulated decoded thumbnail (a real <img src={thumbUrl(...)}/> in v3) */}
-        <div
-          style={{
-            position: "absolute",
-            inset: 0,
-            background: `linear-gradient(135deg, ${ca}, ${cb})`,
-            opacity: loaded ? 1 : 0,
-            transition: "opacity .28s ease",
-          }}
-        />
-        {!loaded && (
-          <div
+        {broken ? (
+          <div style={S.brokenTile} title="이미지를 불러올 수 없습니다">
+            ⊘
+          </div>
+        ) : (
+          <img
+            src={thumbUrl(item, thumbW)}
+            loading="lazy"
+            decoding="async"
+            onLoad={p.onLoaded}
+            onError={p.onBroken}
             style={{
               position: "absolute",
               inset: 0,
-              display: "grid",
-              placeItems: "center",
-              color: C.textFaint,
-              fontFamily: MONO,
-              fontSize: 11,
+              width: "100%",
+              height: "100%",
+              objectFit: "cover",
+              opacity: loaded ? 1 : 0,
+              transition: "opacity .28s ease",
             }}
-          >
-            …
-          </div>
+          />
+        )}
+        {!loaded && !broken && (
+          <div style={S.skelDots}>…</div>
         )}
         <FormatBadge fmt={item.fmt} />
       </div>
@@ -689,7 +929,7 @@ function Tile({ item, tile, left, top, loaded, selected, onSelect, onOpen }: Til
   );
 }
 
-function FormatBadge({ fmt }: { fmt: Fmt }) {
+function FormatBadge({ fmt }: { fmt: string }) {
   const hl = fmt === "webp" ? C.webp : fmt === "avif" ? C.avif : null;
   return (
     <span
@@ -709,7 +949,7 @@ function FormatBadge({ fmt }: { fmt: Fmt }) {
         border: hl ? `1px solid ${hl}` : `1px solid ${C.border}`,
       }}
     >
-      {fmt}
+      {fmt || "?"}
     </span>
   );
 }
@@ -719,13 +959,13 @@ function FormatBadge({ fmt }: { fmt: Fmt }) {
 // ---------------------------------------------------------------------------
 
 interface PreviewProps {
-  item: GridItem | null;
+  item: Item | null;
+  meta: ImageMeta | null;
   onOpenFull: () => void;
   onClose: () => void;
 }
 
-function PreviewPanel({ item, onOpenFull, onClose }: PreviewProps) {
-  const [ca, cb] = item ? tileColors(item.id) : ["#1b2027", "#13161b"];
+function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
   return (
     <aside style={S.preview}>
       <div style={{ ...S.paneHeader, display: "flex", alignItems: "center" }}>
@@ -744,17 +984,26 @@ function PreviewPanel({ item, onOpenFull, onClose }: PreviewProps) {
               margin: 12,
               borderRadius: 8,
               border: `1px solid ${C.border}`,
-              background: `linear-gradient(135deg, ${ca}, ${cb})`,
-              aspectRatio: `${item.w} / ${item.h}`,
+              background: C.skeleton,
+              flex: "0 0 auto",
               maxHeight: "46%",
+              display: "grid",
+              placeItems: "center",
+              overflow: "hidden",
             }}
-          />
+          >
+            <img
+              src={fullUrl(item)}
+              alt={item.name}
+              style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", display: "block" }}
+            />
+          </div>
           <div style={{ padding: "0 14px", overflow: "auto", flex: 1 }}>
             <Meta label="이름" value={item.name} mono />
             <Meta label="형식" value={item.fmt.toUpperCase()} />
-            <Meta label="해상도" value={`${item.w} × ${item.h}`} mono />
-            <Meta label="크기" value={fmtBytes(item.size)} mono />
-            <Meta label="경로" value={`…/${item.name}`} mono dim />
+            <Meta label="해상도" value={meta ? `${meta.width} × ${meta.height}` : "…"} mono />
+            <Meta label="크기" value={meta ? fmtBytes(meta.size) : "…"} mono />
+            <Meta label="경로" value={item.archive ? `${item.archive} › ${item.path}` : item.path} mono dim />
           </div>
           <div style={{ padding: 12, borderTop: `1px solid ${C.borderSoft}` }}>
             <button style={{ ...S.primaryBtn, width: "100%" }} onClick={onOpenFull}>
@@ -808,20 +1057,20 @@ function Meta({
 
 interface StatusProps {
   count: number;
-  node: TreeNode | null;
+  nodeName: string | null;
   sortKey: SortKey;
   selectedName: string | null;
   cols: number;
   rows: number;
 }
 
-function StatusBar({ count, node, sortKey, selectedName, cols, rows }: StatusProps) {
+function StatusBar({ count, nodeName, sortKey, selectedName, cols, rows }: StatusProps) {
   const sortLabel = sortKey === "name" ? "이름" : sortKey === "format" ? "형식" : "크기";
   return (
     <div style={S.statusBar}>
       <Stat>{count.toLocaleString()} 이미지</Stat>
       <Sep />
-      <Stat>{node?.name ?? "—"}</Stat>
+      <Stat>{nodeName ?? "—"}</Stat>
       <Sep />
       <Stat>정렬: {sortLabel}</Stat>
       <div style={{ flex: 1 }} />
@@ -850,18 +1099,17 @@ function Sep() {
 // ---------------------------------------------------------------------------
 
 interface ViewerProps {
-  item: GridItem;
+  item: Item;
   index: number;
   total: number;
-  nodePath: TreeNode[];
+  crumbs: Crumb[];
   onPrev: () => void;
   onNext: () => void;
   onClose: () => void;
 }
 
-function Viewer({ item, index, total, nodePath, onPrev, onNext, onClose }: ViewerProps) {
-  const [ca, cb] = tileColors(item.id);
-  const pathLabel = nodePath.map((n) => n.name).join(" › ");
+function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerProps) {
+  const pathLabel = crumbs.map((c) => c.name).join(" › ");
   return (
     <div style={S.viewerBackdrop} onClick={onClose}>
       <button
@@ -874,15 +1122,14 @@ function Viewer({ item, index, total, nodePath, onPrev, onNext, onClose }: Viewe
         ‹
       </button>
 
-      <div
+      <img
+        src={fullUrl(item)}
+        alt={item.name}
         style={{
-          maxWidth: "82vw",
+          maxWidth: "86vw",
           maxHeight: "82vh",
-          aspectRatio: `${item.w} / ${item.h}`,
-          width: "min(82vw, 1200px)",
-          borderRadius: 10,
-          border: `1px solid ${C.border}`,
-          background: `linear-gradient(135deg, ${ca}, ${cb})`,
+          objectFit: "contain",
+          borderRadius: 8,
           boxShadow: "0 24px 80px rgba(0,0,0,0.6)",
         }}
         onClick={(e) => e.stopPropagation()}
@@ -906,8 +1153,6 @@ function Viewer({ item, index, total, nodePath, onPrev, onNext, onClose }: Viewe
         <span style={{ fontFamily: MONO, color: C.textDim }}>
           {index + 1} / {total}
         </span>
-        <Sep />
-        <span style={{ fontFamily: MONO, color: C.textDim }}>100%</span>
         <button style={{ ...S.iconBtn, marginLeft: 12 }} onClick={onClose} title="닫기 (Esc)">
           ✕
         </button>
@@ -1030,8 +1275,28 @@ const S: Record<string, CSSProperties> = {
     userSelect: "none",
   },
   treeCount: { fontFamily: MONO, fontSize: 10, color: C.textFaint, marginLeft: 6 },
+  treeEmpty: { fontSize: 11, color: C.textFaint, height: 22, display: "flex", alignItems: "center" },
   grid: { flex: 1, minWidth: 0, overflow: "auto", background: C.bg },
   empty: { height: "100%", display: "grid", placeItems: "center", color: C.textFaint, fontSize: 13 },
+  brokenTile: {
+    position: "absolute",
+    inset: 0,
+    display: "grid",
+    placeItems: "center",
+    color: C.danger,
+    fontSize: 28,
+    background: C.skeleton,
+  },
+  skelDots: {
+    position: "absolute",
+    inset: 0,
+    display: "grid",
+    placeItems: "center",
+    color: C.textFaint,
+    fontFamily: MONO,
+    fontSize: 11,
+    pointerEvents: "none",
+  },
   preview: {
     width: 320,
     flexShrink: 0,
