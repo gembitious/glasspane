@@ -295,9 +295,9 @@ Each task has an acceptance criterion (AC).
   and fonts silently fail to load.
 - **Protocol origin differs per platform** — handled in `viewerApi.ts` via a UA check; don't
   hardcode one form.
-- **Thumbnail concurrency:** the protocol handler currently spawns a thread per request; a grid
-  asking for many thumbnails at once can spawn a lot of threads. Harden with a bounded worker
-  pool or a global semaphore (≈ `num_cpus`) around the decode. _(Optimization, not a blocker.)_
+- **Thumbnail concurrency:** the protocol handler spawns a thread per request. Concurrent
+  **decodes** are now capped by a global counting semaphore (≈ `available_parallelism`) around
+  the decode/encode path in `imaging.rs`; cache hits skip the permit. _(Done.)_
 - **Large directories:** rely on virtualization + lazy `<img>` so only visible thumbnails
   decode; don't eagerly fetch metadata for an entire listing.
 - **This is a real app, not a chat artifact:** `localStorage`/persistent storage is fine here.

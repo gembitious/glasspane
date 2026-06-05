@@ -14,6 +14,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use image::{ImageFormat, ImageReader};
@@ -210,6 +211,52 @@ pub(crate) fn read_source_bytes(src: &Src) -> std::io::Result<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// Decode concurrency limit
+// ---------------------------------------------------------------------------
+
+// The protocol handler spawns a thread per request, so a grid asking for many
+// thumbnails at once could run a huge number of concurrent decodes. A counting
+// semaphore (≈ available CPUs) caps how many decode at a time; extra threads
+// block briefly on `acquire` instead of thrashing CPU/memory.
+struct Semaphore {
+    permits: Mutex<usize>,
+    cv: Condvar,
+}
+
+struct Permit<'a>(&'a Semaphore);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        *self.0.permits.lock().unwrap() += 1;
+        self.0.cv.notify_one();
+    }
+}
+
+impl Semaphore {
+    fn acquire(&self) -> Permit<'_> {
+        let mut n = self.permits.lock().unwrap();
+        while *n == 0 {
+            n = self.cv.wait(n).unwrap();
+        }
+        *n -= 1;
+        Permit(self)
+    }
+}
+
+fn decode_sem() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let permits = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Semaphore {
+            permits: Mutex::new(permits),
+            cv: Condvar::new(),
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Image-bytes plane — the `imgsrv` protocol
 // ---------------------------------------------------------------------------
 
@@ -266,11 +313,14 @@ fn serve_thumb<R: Runtime>(
     let dir = thumbs_dir(app)?;
     let cache_path = dir.join(format!("{}.jpg", cache_key(src, w)));
 
-    // disk-cache hit
+    // disk-cache hit — cheap, no decode permit needed
     if let Ok(bytes) = fs::read(&cache_path) {
         return Ok((bytes, "image/jpeg"));
     }
 
+    // bound the number of concurrent decodes (the grid can request hundreds at
+    // once); the permit is held only for the read + decode + encode.
+    let _permit = decode_sem().acquire();
     let raw = read_source_bytes(src).map_err(|e| e.to_string())?;
     let thumb = make_thumb(&raw, w)?;
     let _ = fs::write(&cache_path, &thumb); // best-effort cache write
@@ -282,7 +332,10 @@ fn serve_full(src: &Src) -> Result<(Vec<u8>, &'static str), String> {
     match passthrough_content_type(&ext_of(&src.path)) {
         Some(ct) => Ok((raw, ct)),
         // AVIF / exotic formats: transcode so any webview can render them
-        None => Ok((transcode_jpeg(&raw)?, "image/jpeg")),
+        None => {
+            let _permit = decode_sem().acquire();
+            Ok((transcode_jpeg(&raw)?, "image/jpeg"))
+        }
     }
 }
 
