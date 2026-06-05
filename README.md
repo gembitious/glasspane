@@ -49,10 +49,16 @@ npm run tauri build    # produce a release binary
 
 ### Prerequisites
 
-Besides the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/), AVIF decoding
-links the system **libdav1d**:
+- **Node.js 20.19+ or 22.12+** (Vite 7's minimum). The repo pins Node 22 via `.nvmrc` —
+  `nvm use` (or `fnm use`) picks it up. Older 20.x prints a Vite "please upgrade" error.
+- **Rust (stable)** via [rustup](https://rustup.rs/) — `npm run tauri build` shells out to
+  `cargo`, so a missing toolchain fails with `cargo metadata … program not found`.
+- The rest of the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/) for your OS
+  (WebView, build tools).
 
-- Debian/Ubuntu: `sudo apt install libdav1d-dev`
+AVIF decoding additionally links the system **libdav1d** (≥ 1.3.0):
+
+- Debian/Ubuntu: `sudo apt install libdav1d-dev` (needs 24.04+; 22.04 ships an older 0.9.x)
 - macOS: `brew install dav1d`
 - Windows: install `dav1d` via vcpkg
 
