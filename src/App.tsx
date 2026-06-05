@@ -79,6 +79,9 @@ interface Item {
 
 const TILE: Record<ThumbSizeKey, number> = { S: 120, M: 168, L: 232 };
 const THUMB_W: Record<ThumbSizeKey, number> = { S: 192, M: 256, L: 384 };
+// Preview panel uses a large cached thumbnail rather than decoding the full
+// original; the fullscreen viewer still loads full resolution.
+const PREVIEW_W = 1024;
 const GAP = 12;
 const LABEL_H = 34;
 const OVERSCAN_ROWS = 3;
@@ -1227,7 +1230,7 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
             }}
           >
             <img
-              src={fullUrl(item)}
+              src={thumbUrl(item, PREVIEW_W)}
               alt={item.name}
               style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", display: "block" }}
             />
