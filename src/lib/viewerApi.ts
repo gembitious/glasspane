@@ -99,3 +99,34 @@ export function fullUrl(ref: ImgRef): string {
   if (ref.archive) params.set("archive", ref.archive);
   return `${imgsrvOrigin()}/full?${params.toString()}`;
 }
+
+// ---------------------------------------------------------------------------
+// Batch conversion (decode -> re-encode)
+// ---------------------------------------------------------------------------
+
+export type ConvertFormat = "jpg" | "png" | "webp";
+
+export interface ConvertOpts {
+  format: ConvertFormat;
+  destDir: string;
+  /** JPEG quality 1–100; ignored for png/webp (lossless). */
+  quality?: number;
+  /** Overwrite existing files instead of adding a numeric suffix. */
+  overwrite?: boolean;
+}
+
+export interface ConvertFailure {
+  name: string;
+  error: string;
+}
+
+export interface ConvertReport {
+  ok: number;
+  failed: ConvertFailure[];
+  outputs: string[];
+}
+
+/** Convert images to `opts.format` in `opts.destDir`. */
+export function convertImages(refs: ImgRef[], opts: ConvertOpts): Promise<ConvertReport> {
+  return invoke<ConvertReport>("convert_images", { sources: refs.map(refToSrc), opts });
+}

@@ -80,4 +80,5 @@ The selected tile always scrolls into view as you move.
 - [x] Background thumbnail decode + on-disk cache
 - [x] AVIF decode (enable the `avif-native` feature)
 - [x] Keyboard-first navigation polish
-- [ ] (later) batch export / convert module
+- [x] Filename search/filter + recent folders
+- [x] Batch export / convert module (jpg/png/webp)

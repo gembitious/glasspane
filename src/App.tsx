@@ -24,8 +24,11 @@ import {
   imageMeta,
   thumbUrl,
   fullUrl,
+  convertImages,
   type DirEntry,
   type ImageMeta,
+  type ConvertFormat,
+  type ConvertReport,
 } from "./lib/viewerApi";
 import "./App.css";
 
@@ -190,6 +193,9 @@ export default function App() {
 
   // viewer
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+
+  // batch convert
+  const [convertOpen, setConvertOpen] = useState(false);
 
   // metadata cache (preview + size sort); null = fetched-but-failed/unknown
   const metaRef = useRef<Record<string, ImageMeta | null>>({});
@@ -607,6 +613,8 @@ export default function App() {
         toggleFormat={toggleFormat}
         previewOpen={previewOpen}
         setPreviewOpen={setPreviewOpen}
+        canConvert={items.length > 0}
+        onOpenConvert={() => setConvertOpen(true)}
       />
 
       <div style={S.body}>
@@ -725,6 +733,14 @@ export default function App() {
           onClose={() => setViewerIndex(null)}
         />
       )}
+
+      {convertOpen && (
+        <ConvertDialog
+          selected={selectedItem}
+          all={items}
+          onClose={() => setConvertOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -765,6 +781,8 @@ interface ToolbarProps {
   toggleFormat: (f: KnownFormat) => void;
   previewOpen: boolean;
   setPreviewOpen: (b: boolean) => void;
+  canConvert: boolean;
+  onOpenConvert: () => void;
 }
 
 function Toolbar(p: ToolbarProps) {
@@ -895,6 +913,16 @@ function Toolbar(p: ToolbarProps) {
             </button>
           ))}
         </div>
+
+        <div style={{ flex: 1 }} />
+        <button
+          style={{ ...S.ghostBtn, opacity: p.canConvert ? 1 : 0.5 }}
+          disabled={!p.canConvert}
+          onClick={p.onOpenConvert}
+          title="이미지를 jpg/png/webp로 변환"
+        >
+          변환…
+        </button>
       </div>
     </div>
   );
@@ -1316,6 +1344,182 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
 }
 
 // ---------------------------------------------------------------------------
+// Batch convert dialog
+// ---------------------------------------------------------------------------
+
+interface ConvertDialogProps {
+  selected: Item | null;
+  all: Item[];
+  onClose: () => void;
+}
+
+function ConvertDialog({ selected, all, onClose }: ConvertDialogProps) {
+  const [scope, setScope] = useState<"selected" | "all">(selected ? "selected" : "all");
+  const [format, setFormat] = useState<ConvertFormat>("jpg");
+  const [quality, setQuality] = useState(90);
+  const [overwrite, setOverwrite] = useState(false);
+  const [destDir, setDestDir] = useState("");
+  const [running, setRunning] = useState(false);
+  const [report, setReport] = useState<ConvertReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const sources = scope === "selected" && selected ? [selected] : all;
+
+  const pickDest = async () => {
+    const picked = await openDialog({ directory: true, multiple: false });
+    if (typeof picked === "string") setDestDir(picked);
+  };
+
+  const run = async () => {
+    if (!destDir || running) return;
+    setRunning(true);
+    setError(null);
+    setReport(null);
+    try {
+      const r = await convertImages(sources, {
+        format,
+        destDir,
+        quality: format === "jpg" ? quality : undefined,
+        overwrite,
+      });
+      setReport(r);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div style={S.viewerBackdrop} onClick={running ? undefined : onClose}>
+      <div style={S.modal} onClick={(e) => e.stopPropagation()}>
+        <div style={S.modalHeader}>
+          <span style={{ flex: 1, fontWeight: 600 }}>이미지 변환</span>
+          <button style={S.iconBtn} onClick={onClose} disabled={running} title="닫기">
+            ✕
+          </button>
+        </div>
+
+        <div style={{ padding: 16, overflow: "auto" }}>
+          {/* scope */}
+          <div style={S.field}>
+            <span style={S.fieldLabel}>대상</span>
+            <div style={S.segment}>
+              <button
+                style={{
+                  ...S.segBtn,
+                  ...(scope === "selected" ? S.segBtnOn : null),
+                  opacity: selected ? 1 : 0.5,
+                }}
+                disabled={!selected}
+                onClick={() => setScope("selected")}
+              >
+                선택 이미지 {selected ? "1" : "0"}개
+              </button>
+              <button
+                style={{ ...S.segBtn, ...(scope === "all" ? S.segBtnOn : null) }}
+                onClick={() => setScope("all")}
+              >
+                현재 목록 전체 {all.length}개
+              </button>
+            </div>
+          </div>
+
+          {/* format */}
+          <div style={S.field}>
+            <span style={S.fieldLabel}>형식</span>
+            <div style={S.segment}>
+              {(["jpg", "png", "webp"] as ConvertFormat[]).map((f) => (
+                <button
+                  key={f}
+                  style={{ ...S.segBtn, ...(format === f ? S.segBtnOn : null) }}
+                  onClick={() => setFormat(f)}
+                >
+                  {f.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* quality (jpg only) */}
+          <div style={{ ...S.field, opacity: format === "jpg" ? 1 : 0.4 }}>
+            <span style={S.fieldLabel}>품질</span>
+            <input
+              type="range"
+              min={1}
+              max={100}
+              value={quality}
+              disabled={format !== "jpg"}
+              onChange={(e) => setQuality(Number(e.currentTarget.value))}
+              style={{ flex: 1 }}
+            />
+            <span style={{ fontFamily: MONO, width: 32, textAlign: "right" }}>{quality}</span>
+          </div>
+          {format !== "jpg" && (
+            <div style={{ ...S.hint, marginTop: -4 }}>PNG/WebP는 무손실로 저장됩니다.</div>
+          )}
+
+          {/* destination */}
+          <div style={S.field}>
+            <span style={S.fieldLabel}>저장 위치</span>
+            <button style={S.ghostBtn} onClick={pickDest} disabled={running}>
+              폴더 선택…
+            </button>
+            <span style={{ ...S.dropdownPath, flex: 1 }} title={destDir}>
+              {destDir || "선택되지 않음"}
+            </span>
+          </div>
+
+          {/* overwrite */}
+          <label style={{ ...S.field, cursor: "pointer" }}>
+            <span style={S.fieldLabel}>덮어쓰기</span>
+            <input
+              type="checkbox"
+              checked={overwrite}
+              onChange={(e) => setOverwrite(e.currentTarget.checked)}
+            />
+            <span style={S.hint}>끄면 같은 이름은 _1, _2…로 저장</span>
+          </label>
+
+          {/* result */}
+          {error && <div style={{ ...S.hint, color: C.danger }}>오류: {error}</div>}
+          {report && (
+            <div style={S.reportBox}>
+              <div style={{ color: C.webp }}>성공 {report.ok}개</div>
+              {report.failed.length > 0 && (
+                <div style={{ color: C.danger, marginTop: 4 }}>
+                  실패 {report.failed.length}개
+                  <div style={{ maxHeight: 120, overflow: "auto", marginTop: 4 }}>
+                    {report.failed.map((f) => (
+                      <div key={f.name} style={{ fontFamily: MONO, fontSize: 11 }}>
+                        {baseName(f.name)}: {f.error}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div style={S.modalFooter}>
+          <button style={S.ghostBtn} onClick={onClose} disabled={running}>
+            {report ? "닫기" : "취소"}
+          </button>
+          <button
+            style={{ ...S.primaryBtn, opacity: !destDir || running ? 0.5 : 1 }}
+            onClick={run}
+            disabled={!destDir || running}
+          >
+            {running ? "변환 중…" : `변환 시작 (${sources.length})`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Styles
 // ---------------------------------------------------------------------------
 
@@ -1567,6 +1771,42 @@ const S: Record<string, CSSProperties> = {
     padding: "0 16px",
     background: C.panel,
     borderTop: `1px solid ${C.border}`,
+    fontSize: 12,
+  },
+  modal: {
+    width: "min(92vw, 520px)",
+    maxHeight: "86vh",
+    display: "flex",
+    flexDirection: "column",
+    background: C.panel,
+    border: `1px solid ${C.border}`,
+    borderRadius: 10,
+    boxShadow: "0 24px 80px rgba(0,0,0,0.6)",
+    overflow: "hidden",
+  },
+  modalHeader: {
+    display: "flex",
+    alignItems: "center",
+    padding: "12px 16px",
+    borderBottom: `1px solid ${C.borderSoft}`,
+    fontSize: 14,
+  },
+  modalFooter: {
+    display: "flex",
+    justifyContent: "flex-end",
+    gap: 8,
+    padding: 12,
+    borderTop: `1px solid ${C.borderSoft}`,
+  },
+  field: { display: "flex", alignItems: "center", gap: 10, marginBottom: 14, minHeight: 28 },
+  fieldLabel: { width: 70, flexShrink: 0, color: C.textDim, fontSize: 12 },
+  hint: { color: C.textFaint, fontSize: 11, marginBottom: 14 },
+  reportBox: {
+    marginTop: 6,
+    padding: 10,
+    background: C.panelAlt,
+    border: `1px solid ${C.border}`,
+    borderRadius: 6,
     fontSize: 12,
   },
 };

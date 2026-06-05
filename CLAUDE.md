@@ -118,6 +118,10 @@ scaffolded; UI wired to the backend ("**v3**", §9); AVIF decode enabled (`avif-
 - `list_dir(path: String) -> Vec<DirEntry>`, `DirEntry = { name, path, kind: "dir"|"archive"|"image" }`, sorted dirs-first then name (case-insensitive).
 - `list_archive(path: String) -> Vec<ArchiveEntry>`, `ArchiveEntry = { name }` — the image entries inside the zip.
 - `image_meta(src: Src) -> ImageMeta`, `ImageMeta = { width, height, size }`.
+- `convert_images(sources: Vec<Src>, opts: ConvertOpts) -> ConvertReport` (in `convert.rs`) —
+  decode each source and re-encode it into `opts.destDir`.
+  `ConvertOpts = { format: "jpg"|"png"|"webp", destDir, quality?, overwrite? }`
+  (JPEG honors `quality`; PNG/WebP are lossless). `ConvertReport = { ok, failed: [{name, error}], outputs }`.
 - `Src = { archive?: string, path: string }` — if `archive` is set, `path` is the **entry name
   inside that zip**; otherwise `path` is a **filesystem path**.
 
@@ -302,12 +306,11 @@ Each task has an acceptance criterion (AC).
 ## 11. Roadmap (after v3)
 
 - ~~Enable AVIF decode (`avif-native` + libdav1d).~~ **Done.**
-- **Batch export / convert module** (deferred): right-click a selection / folder / zip → convert
-  to jpg/png/webp. Implement decode→encode in Rust. _(The user has an existing PyQt WebP→JPG
-  converter whose logic and UX are a useful reference, but here it's reimplemented in Rust.)_
-  Build it as an isolated **feature module**, not a plugin system.
+- ~~**Batch export / convert module**: convert a selection / list → jpg/png/webp, decode→encode
+  in Rust as an isolated feature module (`convert.rs` + `convert_images`).~~ **Done.** (Reached
+  from the toolbar **변환…** button; JPEG quality is configurable, PNG/WebP are lossless.)
 - Multi-select; date sort; configurable keybindings.
-- Recent folders; filename search/filter.
+- ~~Recent folders; filename search/filter.~~ **Done.**
 - Optional: serve disk-cached thumbnails via the built-in `asset:` protocol
   (`convertFileSrc`) as an alternative to `imgsrv` for the thumbnail path (full images and
   zip-internal images still need `imgsrv`).

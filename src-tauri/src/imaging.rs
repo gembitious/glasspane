@@ -178,7 +178,7 @@ pub fn image_meta(src: Src) -> Result<ImageMeta, String> {
 // Reading source bytes (filesystem file or entry inside a zip)
 // ---------------------------------------------------------------------------
 
-fn read_source_bytes(src: &Src) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_source_bytes(src: &Src) -> std::io::Result<Vec<u8>> {
     match &src.archive {
         Some(zip_path) => {
             let file = fs::File::open(zip_path)?;
