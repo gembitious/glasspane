@@ -78,6 +78,17 @@ still builds and AVIF files simply show a broken-thumbnail placeholder.
 **Fullscreen viewer:** `←` `→` navigate, `Home` `End` jump to first/last, `Esc` closes.
 The selected tile always scrolls into view as you move.
 
+## Building & releasing
+
+```bash
+npm run tauri build              # release binary + native bundles for the host OS
+npm run tauri build -- --no-bundle   # release binary only (skips deb/AppImage/etc.)
+```
+
+Pushing a `v*` tag (or running the **release** workflow manually) builds bundles for
+macOS, Linux, and Windows via [`tauri-action`](.github/workflows/release.yml) and attaches
+them to a draft GitHub Release.
+
 ## Roadmap
 
 - [x] Wire the UI to real directories and archives
@@ -87,3 +98,4 @@ The selected tile always scrolls into view as you move.
 - [x] Filename search/filter + recent folders
 - [x] Batch export / convert module (jpg/png/webp)
 - [x] Multi-select + date/size sort
+- [x] Packaging (release build + CI release workflow)

@@ -75,8 +75,9 @@ Three artifacts already exist (provided in the repo by the user), **not yet wire
 Also provided: `README.md` and `.gitignore` for the repo root.
 
 **Done:** architecture decided; prototype, backend module, and bridge written; project
-scaffolded; UI wired to the backend ("**v3**", §9); AVIF decode enabled (`avif-native`).
-**Not done:** packaging.
+scaffolded; UI wired to the backend ("**v3**", §9); AVIF decode enabled (`avif-native`);
+post-v3 features (search/filter, recent folders, batch convert, multi-select, date sort);
+packaging (release build verified + `.github/workflows/release.yml` via `tauri-action`).
 
 ---
 
