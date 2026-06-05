@@ -24,7 +24,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "category": "Graphics",
+    "category": "Graphics and Design",
     "shortDescription": "A fast, lightweight personal image viewer",
     "longDescription": "glasspane is an explorer-style image viewer that treats .zip/.cbz archives like folders, views WebP/AVIF natively, and keeps a virtualized thumbnail grid smooth on folders with thousands of images.",
     "publisher": "glasspane",
