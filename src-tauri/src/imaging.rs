@@ -14,8 +14,8 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::UNIX_EPOCH;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use image::{ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
@@ -151,8 +151,8 @@ pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
 
 #[tauri::command]
 pub fn list_archive(path: String) -> Result<Vec<ArchiveEntry>, String> {
-    let file = fs::File::open(&path).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let archive = archive_for(&path).map_err(|e| e.to_string())?;
+    let mut archive = archive.lock().unwrap();
 
     let mut out: Vec<ArchiveEntry> = Vec::new();
     for i in 0..archive.len() {
@@ -196,8 +196,10 @@ pub fn image_meta(src: Src) -> Result<ImageMeta, String> {
 pub(crate) fn read_source_bytes(src: &Src) -> std::io::Result<Vec<u8>> {
     match &src.archive {
         Some(zip_path) => {
-            let file = fs::File::open(zip_path)?;
-            let mut archive = zip::ZipArchive::new(file).map_err(std::io::Error::other)?;
+            // Reuse a cached, already-parsed archive instead of reopening and
+            // re-reading the central directory on every entry request.
+            let archive = archive_for(zip_path)?;
+            let mut archive = archive.lock().unwrap();
             let mut entry = archive
                 .by_name(&src.path)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
@@ -206,6 +208,80 @@ pub(crate) fn read_source_bytes(src: &Src) -> std::io::Result<Vec<u8>> {
             Ok(buf)
         }
         None => fs::read(&src.path),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parsed-archive cache (avoids re-parsing a zip's central directory per entry)
+// ---------------------------------------------------------------------------
+
+type SharedArchive = Arc<Mutex<zip::ZipArchive<fs::File>>>;
+
+struct CachedArchive {
+    sig: (u64, u64), // (size, mtime) — invalidates the cache if the file changes
+    archive: SharedArchive,
+}
+
+struct ArchiveCache {
+    map: HashMap<String, CachedArchive>,
+    order: Vec<String>, // LRU recency; back = most recently used
+}
+
+const ARCHIVE_CACHE_CAP: usize = 4;
+
+fn archive_cache() -> &'static Mutex<ArchiveCache> {
+    static CACHE: OnceLock<Mutex<ArchiveCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(ArchiveCache {
+            map: HashMap::new(),
+            order: Vec::new(),
+        })
+    })
+}
+
+/// Return a shared handle to the parsed archive at `path`, opening (and caching)
+/// it on a miss. The handle is cloned out before the read, so the cache lock is
+/// not held while an entry is decompressed.
+fn archive_for(path: &str) -> std::io::Result<SharedArchive> {
+    let sig = file_sig(path);
+    let mut cache = archive_cache().lock().unwrap();
+
+    if let Some(cached) = cache.map.get(path) {
+        if cached.sig == sig {
+            let handle = cached.archive.clone();
+            touch_lru(&mut cache.order, path);
+            return Ok(handle);
+        }
+        // file changed on disk — drop the stale entry and reopen below
+        cache.map.remove(path);
+        cache.order.retain(|p| p != path);
+    }
+
+    let file = fs::File::open(path)?;
+    let archive = zip::ZipArchive::new(file).map_err(std::io::Error::other)?;
+    let handle: SharedArchive = Arc::new(Mutex::new(archive));
+    cache.map.insert(
+        path.to_string(),
+        CachedArchive {
+            sig,
+            archive: handle.clone(),
+        },
+    );
+    cache.order.push(path.to_string());
+
+    // evict least-recently-used while over capacity
+    while cache.order.len() > ARCHIVE_CACHE_CAP {
+        let evict = cache.order.remove(0);
+        cache.map.remove(&evict);
+    }
+
+    Ok(handle)
+}
+
+fn touch_lru(order: &mut Vec<String>, path: &str) {
+    if let Some(i) = order.iter().position(|p| p == path) {
+        let p = order.remove(i);
+        order.push(p);
     }
 }
 
@@ -382,6 +458,49 @@ fn thumbs_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// On-disk thumbnail cache budget. Beyond this, the oldest files are pruned.
+const THUMB_CACHE_BUDGET: u64 = 512 * 1024 * 1024; // 512 MiB
+
+/// Prune the thumbnail cache down to `THUMB_CACHE_BUDGET`, deleting the
+/// least-recently-modified files first. Cheap no-op when already under budget.
+/// Best-effort: any IO error just stops the prune (the cache self-heals).
+pub fn prune_thumb_cache<R: Runtime>(app: &AppHandle<R>) {
+    let dir = match thumbs_dir(app) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let rd = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+
+    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut total: u64 = 0;
+    for entry in rd.flatten() {
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+                total += meta.len();
+                files.push((entry.path(), meta.len(), mtime));
+            }
+        }
+    }
+
+    if total <= THUMB_CACHE_BUDGET {
+        return;
+    }
+
+    files.sort_by_key(|f| f.2); // oldest first
+    for (path, size, _) in files {
+        if total <= THUMB_CACHE_BUDGET {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total -= size;
+        }
+    }
+}
+
 /// Cache key = container file (size, mtime) + inner entry name + w.
 fn cache_key(src: &Src, w: u32) -> String {
     let container = src.archive.as_deref().unwrap_or(&src.path);
@@ -490,4 +609,75 @@ fn error_response(status: StatusCode, msg: &str) -> Response<Vec<u8>> {
         .header("Access-Control-Allow-Origin", "*")
         .body(msg.as_bytes().to_vec())
         .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Tests — pure helpers (no Tauri runtime / filesystem needed)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_query_handles_pairs_percent_and_plus() {
+        let q = parse_query("path=a%2Fb%20c&w=256&archive=x.zip");
+        assert_eq!(q.get("path").unwrap(), "a/b c");
+        assert_eq!(q.get("w").unwrap(), "256");
+        assert_eq!(q.get("archive").unwrap(), "x.zip");
+
+        assert!(parse_query("").is_empty());
+        assert_eq!(parse_query("k=a+b").get("k").unwrap(), "a b");
+    }
+
+    #[test]
+    fn percent_decode_passes_invalid_escapes_through() {
+        assert_eq!(percent_decode("%41%42"), "AB");
+        assert_eq!(percent_decode("100%"), "100%"); // dangling % is literal
+        assert_eq!(percent_decode("a%zzb"), "a%zzb"); // non-hex stays literal
+    }
+
+    #[test]
+    fn format_classification() {
+        assert_eq!(ext_of("PHOTO.JPG"), "jpg");
+        assert_eq!(ext_of("noext"), "");
+        assert!(is_image("webp") && is_image("avif") && is_image("png"));
+        assert!(!is_image("txt"));
+        assert!(is_archive("zip") && is_archive("cbz") && !is_archive("rar"));
+        assert_eq!(passthrough_content_type("png"), Some("image/png"));
+        assert_eq!(passthrough_content_type("avif"), None); // must be transcoded
+    }
+
+    #[test]
+    fn zip_sort_key_is_monotonic_in_time() {
+        // DOS time has 2-second resolution, so step by a minute / a day to stay
+        // above the encoding granularity.
+        let earlier = zip::DateTime::from_date_and_time(2020, 1, 1, 0, 0, 0).unwrap();
+        let later = zip::DateTime::from_date_and_time(2020, 1, 1, 0, 1, 0).unwrap();
+        let next_day = zip::DateTime::from_date_and_time(2020, 1, 2, 0, 0, 0).unwrap();
+        assert!(zip_dt_sort_key(earlier) < zip_dt_sort_key(later));
+        assert!(zip_dt_sort_key(later) < zip_dt_sort_key(next_day));
+    }
+
+    #[test]
+    fn cache_key_is_stable_and_sensitive_to_inputs() {
+        let a = Src {
+            archive: None,
+            path: "/tmp/does-not-exist.png".into(),
+        };
+        // deterministic for identical inputs
+        assert_eq!(cache_key(&a, 256), cache_key(&a, 256));
+        // width is part of the key
+        assert_ne!(cache_key(&a, 256), cache_key(&a, 512));
+        // entry path is part of the key
+        let b = Src {
+            archive: None,
+            path: "/tmp/other.png".into(),
+        };
+        assert_ne!(cache_key(&a, 256), cache_key(&b, 256));
+        // 16 hex chars
+        let key = cache_key(&a, 256);
+        assert_eq!(key.len(), 16);
+        assert!(key.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
 }
