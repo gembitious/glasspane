@@ -92,6 +92,8 @@ zoomed in. The selected tile always scrolls into view as you move.
 
 ## Other niceties
 
+- **Address bar:** double-click the breadcrumb (or the `✎` button) to type/paste any folder or
+  `.zip`/`.cbz` path and jump there; `↑` goes to the parent folder (even above the current root).
 - **Drag and drop** a folder or `.zip`/`.cbz` onto the window to open it.
 - **Copy path** of the selected image from the preview panel.
 - The **window size and position are remembered** across launches.

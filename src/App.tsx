@@ -142,6 +142,17 @@ function sepOf(p: string): string {
   return p.includes("\\") ? "\\" : "/";
 }
 
+// Parent directory of a path (keeps the root: "/a" → "/", "C:\\a" → "C:\\").
+function parentDir(p: string): string {
+  const sep = sepOf(p);
+  const trimmed = p.replace(/[\\/]+$/, "");
+  const idx = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  if (idx < 0) return trimmed;
+  if (idx === 0) return sep; // unix root "/"
+  if (trimmed[idx - 1] === ":") return trimmed.slice(0, idx + 1) + sep; // "C:\\"
+  return trimmed.slice(0, idx);
+}
+
 function baseName(p: string): string {
   const parts = p.split(/[\\/]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : p;
@@ -702,6 +713,33 @@ export default function App() {
     [rootPath, selected],
   );
 
+  // Explorer-style address bar: jump to any typed/pasted path. A folder or zip
+  // inside the current root just selects (tree preserved); anything else re-roots.
+  const navigateToPath = useCallback(
+    (raw: string) => {
+      const path = raw.trim().replace(/[\\/]+$/, "");
+      if (!path) return;
+      const isArchive = /\.(zip|cbz)$/i.test(path);
+      const inRoot =
+        rootPath && (path === rootPath || path.startsWith(rootPath + sepOf(rootPath)));
+      if (inRoot) {
+        if (!isArchive) setExpanded((s) => new Set(s).add(path));
+        setSelected({ path, kind: isArchive ? "archive" : "dir" });
+      } else if (isArchive) {
+        openRoot(parentDir(path));
+        setSelected({ path, kind: "archive" });
+      } else {
+        openRoot(path);
+      }
+    },
+    [rootPath, openRoot],
+  );
+
+  const navigateUp = useCallback(() => {
+    const here = selected?.path ?? rootPath;
+    if (here) navigateToPath(parentDir(here));
+  }, [selected, rootPath, navigateToPath]);
+
   const selectedNodeName = selected ? baseName(selected.path) : null;
 
   // =========================================================================
@@ -741,6 +779,8 @@ export default function App() {
         recent={recent}
         onPickRecent={openRoot}
         onCrumb={selectNode}
+        onNavigatePath={navigateToPath}
+        onUp={navigateUp}
         query={query}
         setQuery={setQuery}
         thumbSize={thumbSize}
@@ -913,6 +953,8 @@ interface ToolbarProps {
   recent: string[];
   onPickRecent: (path: string) => void;
   onCrumb: (path: string, kind: NodeKind) => void;
+  onNavigatePath: (path: string) => void;
+  onUp: () => void;
   query: string;
   setQuery: (s: string) => void;
   thumbSize: ThumbSizeKey;
@@ -929,6 +971,17 @@ interface ToolbarProps {
 
 function Toolbar(p: ToolbarProps) {
   const [recentOpen, setRecentOpen] = useState(false);
+  const [editingPath, setEditingPath] = useState(false);
+  const [draft, setDraft] = useState("");
+  const currentPath = p.crumbs.length ? p.crumbs[p.crumbs.length - 1].path : "";
+  const beginEdit = () => {
+    setDraft(currentPath);
+    setEditingPath(true);
+  };
+  const commitEdit = () => {
+    setEditingPath(false);
+    if (draft.trim()) p.onNavigatePath(draft);
+  };
   return (
     <div style={S.toolbarWrap}>
       <div style={S.toolbarRow}>
@@ -967,20 +1020,57 @@ function Toolbar(p: ToolbarProps) {
             </>
           )}
         </div>
-        <div style={S.crumbs}>
-          {p.crumbs.map((c, i) => (
-            <span key={c.path} style={{ display: "inline-flex", alignItems: "center" }}>
-              {i > 0 && <span style={{ color: C.textFaint, margin: "0 6px" }}>›</span>}
-              <button
-                style={{ ...S.crumb, color: i === p.crumbs.length - 1 ? C.text : C.textDim }}
-                onClick={() => p.onCrumb(c.path, c.kind)}
-                title={c.path}
-              >
-                {c.name}
-              </button>
-            </span>
-          ))}
-        </div>
+        <button
+          style={{ ...S.iconBtn, opacity: currentPath ? 1 : 0.4 }}
+          disabled={!currentPath}
+          onClick={p.onUp}
+          title="상위 폴더 (한 단계 위로)"
+        >
+          ↑
+        </button>
+        {editingPath ? (
+          <input
+            style={S.pathInput}
+            value={draft}
+            autoFocus
+            spellCheck={false}
+            placeholder="경로 입력 후 Enter (폴더 또는 .zip/.cbz)"
+            onChange={(e) => setDraft(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitEdit();
+              else if (e.key === "Escape") setEditingPath(false);
+            }}
+            onBlur={() => setEditingPath(false)}
+          />
+        ) : (
+          <div
+            style={S.crumbs}
+            title="클릭하면 경로를 직접 입력할 수 있습니다"
+            onDoubleClick={beginEdit}
+          >
+            {p.crumbs.map((c, i) => (
+              <span key={c.path} style={{ display: "inline-flex", alignItems: "center" }}>
+                {i > 0 && <span style={{ color: C.textFaint, margin: "0 6px" }}>›</span>}
+                <button
+                  style={{ ...S.crumb, color: i === p.crumbs.length - 1 ? C.text : C.textDim }}
+                  onClick={() => p.onCrumb(c.path, c.kind)}
+                  title={c.path}
+                >
+                  {c.name}
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        <button
+          style={S.iconBtn}
+          // keep the input focused (don't blur-cancel) when clicking to commit
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={editingPath ? commitEdit : beginEdit}
+          title="경로 직접 입력"
+        >
+          {editingPath ? "↵" : "✎"}
+        </button>
         <div style={{ flex: 1 }} />
         <div style={S.searchWrap}>
           <span style={{ color: C.textFaint, fontSize: 12 }}>🔎</span>
@@ -1839,7 +1929,20 @@ const S: Record<string, CSSProperties> = {
   },
   toolbarWrap: { flexShrink: 0, background: C.panel, borderBottom: `1px solid ${C.border}` },
   toolbarRow: { display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", minHeight: 44 },
-  crumbs: { display: "flex", alignItems: "center", marginLeft: 6, overflow: "hidden" },
+  crumbs: { display: "flex", alignItems: "center", marginLeft: 6, overflow: "hidden", cursor: "text" },
+  pathInput: {
+    flex: 1,
+    minWidth: 120,
+    marginLeft: 6,
+    background: C.panelAlt,
+    border: `1px solid ${C.accent}`,
+    borderRadius: 6,
+    outline: "none",
+    color: C.text,
+    fontFamily: MONO,
+    fontSize: 12,
+    padding: "5px 8px",
+  } as CSSProperties,
   crumb: {
     background: "none",
     border: "none",
