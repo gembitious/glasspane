@@ -174,13 +174,33 @@ pub fn list_archive(path: String) -> Result<Vec<ArchiveEntry>, String> {
 
 #[tauri::command]
 pub fn image_meta(src: Src) -> Result<ImageMeta, String> {
-    let raw = read_source_bytes(&src).map_err(|e| e.to_string())?;
-    let size = raw.len() as u64;
-
-    let reader = ImageReader::new(Cursor::new(&raw))
-        .with_guessed_format()
-        .map_err(|e| e.to_string())?;
-    let (width, height) = reader.into_dimensions().map_err(|e| e.to_string())?;
+    let (width, height, size) = match &src.archive {
+        // Filesystem file: read only the header for dimensions (no full load)
+        // and take the byte size from metadata.
+        None => {
+            let size = fs::metadata(&src.path)
+                .map(|m| m.len())
+                .map_err(|e| e.to_string())?;
+            let (w, h) = ImageReader::open(&src.path)
+                .map_err(|e| e.to_string())?
+                .with_guessed_format()
+                .map_err(|e| e.to_string())?
+                .into_dimensions()
+                .map_err(|e| e.to_string())?;
+            (w, h, size)
+        }
+        // Zip entry: must decompress to read it, so use the bytes we get.
+        Some(_) => {
+            let raw = read_source_bytes(&src).map_err(|e| e.to_string())?;
+            let size = raw.len() as u64;
+            let (w, h) = ImageReader::new(Cursor::new(&raw))
+                .with_guessed_format()
+                .map_err(|e| e.to_string())?
+                .into_dimensions()
+                .map_err(|e| e.to_string())?;
+            (w, h, size)
+        }
+    };
 
     Ok(ImageMeta {
         width,
