@@ -83,6 +83,11 @@ const THUMB_W: Record<ThumbSizeKey, number> = { S: 192, M: 256, L: 384 };
 // original; the fullscreen viewer still loads full resolution.
 const PREVIEW_W = 1024;
 const GAP = 12;
+
+// Natural-order name comparison so "page2" sorts before "page10" (matters a lot
+// for numbered comic/zip pages). One reused Collator is cheap.
+const nameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const byName = (a: string, b: string) => nameCollator.compare(a, b);
 const LABEL_H = 34;
 const OVERSCAN_ROWS = 3;
 
@@ -383,13 +388,13 @@ export default function App() {
     sorted.sort((a, b) => {
       switch (sortKey) {
         case "name":
-          return a.name.localeCompare(b.name);
+          return byName(a.name, b.name);
         case "format":
-          return a.fmt.localeCompare(b.fmt) || a.name.localeCompare(b.name);
+          return a.fmt.localeCompare(b.fmt) || byName(a.name, b.name);
         case "size":
-          return b.size - a.size || a.name.localeCompare(b.name);
+          return b.size - a.size || byName(a.name, b.name);
         case "date":
-          return b.mtime - a.mtime || a.name.localeCompare(b.name);
+          return b.mtime - a.mtime || byName(a.name, b.name);
       }
     });
     return sorted;
