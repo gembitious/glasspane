@@ -111,13 +111,19 @@ fn encode(img: &image::DynamicImage, format: &str, quality: u8) -> Result<Vec<u8
                 .map_err(|e| e.to_string())?;
         }
         "png" => {
-            img.write_to(&mut out, ImageFormat::Png).map_err(|e| e.to_string())?;
+            img.write_to(&mut out, ImageFormat::Png)
+                .map_err(|e| e.to_string())?;
         }
         "webp" => {
             // the `image` crate only supports lossless WebP encoding
             let rgba = img.to_rgba8();
             image::codecs::webp::WebPEncoder::new_lossless(&mut out)
-                .write_image(rgba.as_raw(), rgba.width(), rgba.height(), ExtendedColorType::Rgba8)
+                .write_image(
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    ExtendedColorType::Rgba8,
+                )
                 .map_err(|e| e.to_string())?;
         }
         other => return Err(format!("unsupported format: {other}")),
