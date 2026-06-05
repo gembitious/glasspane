@@ -86,6 +86,8 @@ type KnownFormat = (typeof KNOWN_FORMATS)[number];
 const SIZE_SORT_LIMIT = 4000;
 
 const ROOT_KEY = "glasspane.root";
+const RECENT_KEY = "glasspane.recent";
+const RECENT_MAX = 8;
 
 // ---------------------------------------------------------------------------
 // Path / format helpers
@@ -153,8 +155,18 @@ function breadcrumb(root: string, sel: string, selKind: NodeKind): Crumb[] {
 // App
 // ===========================================================================
 
+function loadRecent(): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]");
+    return Array.isArray(v) ? (v.filter((x) => typeof x === "string") as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
 export default function App() {
   const [rootPath, setRootPath] = useState<string | null>(() => localStorage.getItem(ROOT_KEY));
+  const [recent, setRecent] = useState<string[]>(loadRecent);
 
   // tree state
   const [dirCache, setDirCache] = useState<Record<string, DirEntry[]>>({});
@@ -174,6 +186,7 @@ export default function App() {
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [activeFormats, setActiveFormats] = useState<Set<KnownFormat>>(new Set(KNOWN_FORMATS));
   const [previewOpen, setPreviewOpen] = useState(true);
+  const [query, setQuery] = useState("");
 
   // viewer
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
@@ -216,17 +229,25 @@ export default function App() {
   // Open root folder
   // -------------------------------------------------------------------------
 
-  const pickFolder = useCallback(async () => {
-    const picked = await openDialog({ directory: true, multiple: false });
-    if (typeof picked !== "string") return;
+  const openRoot = useCallback((picked: string) => {
     setRootPath(picked);
     localStorage.setItem(ROOT_KEY, picked);
+    setRecent((prev) => {
+      const next = [picked, ...prev.filter((p) => p !== picked)].slice(0, RECENT_MAX);
+      localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+      return next;
+    });
     // reset everything tied to the previous root
     setDirCache({});
     setArchiveCount({});
     setExpanded(new Set([picked]));
     setSelected({ path: picked, kind: "dir" });
   }, []);
+
+  const pickFolder = useCallback(async () => {
+    const picked = await openDialog({ directory: true, multiple: false });
+    if (typeof picked === "string") openRoot(picked);
+  }, [openRoot]);
 
   // expand root + select it on first mount when a root was persisted
   useEffect(() => {
@@ -254,6 +275,7 @@ export default function App() {
     setGridError(null);
     setSelectedItemId(null);
     setViewerIndex(null);
+    setQuery("");
     metaRef.current = {};
     loadedRef.current = new Set();
     brokenRef.current = new Set();
@@ -308,7 +330,9 @@ export default function App() {
   // -------------------------------------------------------------------------
 
   const items = useMemo(() => {
+    const q = query.trim().toLowerCase();
     const filtered = nodeItems.filter((it) => {
+      if (q && !it.name.toLowerCase().includes(q)) return false;
       const known = (KNOWN_FORMATS as readonly string[]).includes(it.fmt);
       return known ? activeFormats.has(it.fmt as KnownFormat) : true;
     });
@@ -329,7 +353,7 @@ export default function App() {
     return sorted;
     // metaTick keeps the size-sort fresh as metadata streams in
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeItems, activeFormats, sortKey, metaTick]);
+  }, [nodeItems, activeFormats, sortKey, metaTick, query]);
 
   const selectedItem = useMemo(
     () => items.find((it) => it.id === selectedItemId) ?? null,
@@ -570,7 +594,11 @@ export default function App() {
       <Toolbar
         crumbs={crumbs}
         onPickFolder={pickFolder}
+        recent={recent}
+        onPickRecent={openRoot}
         onCrumb={selectNode}
+        query={query}
+        setQuery={setQuery}
         thumbSize={thumbSize}
         setThumbSize={setThumbSize}
         sortKey={sortKey}
@@ -624,7 +652,11 @@ export default function App() {
             <div style={S.empty}>불러오는 중…</div>
           ) : items.length === 0 ? (
             <div style={S.empty}>
-              {selected ? "이 위치에 표시할 이미지가 없습니다." : "폴더 또는 zip을 선택하세요."}
+              {!selected
+                ? "폴더 또는 zip을 선택하세요."
+                : query.trim()
+                  ? `"${query.trim()}"에 해당하는 이미지가 없습니다.`
+                  : "이 위치에 표시할 이미지가 없습니다."}
             </div>
           ) : (
             <div style={{ position: "relative", height: totalH, width: "100%" }}>
@@ -720,7 +752,11 @@ function TitleBar() {
 interface ToolbarProps {
   crumbs: Crumb[];
   onPickFolder: () => void;
+  recent: string[];
+  onPickRecent: (path: string) => void;
   onCrumb: (path: string, kind: NodeKind) => void;
+  query: string;
+  setQuery: (s: string) => void;
   thumbSize: ThumbSizeKey;
   setThumbSize: (s: ThumbSizeKey) => void;
   sortKey: SortKey;
@@ -732,12 +768,45 @@ interface ToolbarProps {
 }
 
 function Toolbar(p: ToolbarProps) {
+  const [recentOpen, setRecentOpen] = useState(false);
   return (
     <div style={S.toolbarWrap}>
       <div style={S.toolbarRow}>
         <button style={S.primaryBtn} onClick={p.onPickFolder} title="폴더를 선택해 트리 루트로 엽니다">
           폴더 열기
         </button>
+        <div style={{ position: "relative" }}>
+          <button
+            style={{ ...S.ghostBtn, opacity: p.recent.length ? 1 : 0.5 }}
+            disabled={!p.recent.length}
+            onClick={() => setRecentOpen((v) => !v)}
+            title="최근 연 폴더"
+          >
+            최근 ▾
+          </button>
+          {recentOpen && p.recent.length > 0 && (
+            <>
+              <div style={S.dropdownScrim} onClick={() => setRecentOpen(false)} />
+              <div style={S.dropdown}>
+                {p.recent.map((path) => (
+                  <button
+                    key={path}
+                    style={S.dropdownItem}
+                    title={path}
+                    onClick={() => {
+                      setRecentOpen(false);
+                      p.onPickRecent(path);
+                    }}
+                  >
+                    <span style={{ marginRight: 6 }}>📁</span>
+                    <span style={S.dropdownName}>{baseName(path) || path}</span>
+                    <span style={S.dropdownPath}>{path}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
         <div style={S.crumbs}>
           {p.crumbs.map((c, i) => (
             <span key={c.path} style={{ display: "inline-flex", alignItems: "center" }}>
@@ -753,6 +822,20 @@ function Toolbar(p: ToolbarProps) {
           ))}
         </div>
         <div style={{ flex: 1 }} />
+        <div style={S.searchWrap}>
+          <span style={{ color: C.textFaint, fontSize: 12 }}>🔎</span>
+          <input
+            style={S.searchInput}
+            value={p.query}
+            placeholder="파일명 검색…"
+            onChange={(e) => p.setQuery(e.currentTarget.value)}
+          />
+          {p.query && (
+            <button style={S.searchClear} onClick={() => p.setQuery("")} title="지우기">
+              ✕
+            </button>
+          )}
+        </div>
         <button
           style={{ ...S.ghostBtn, color: p.previewOpen ? C.accent : C.textDim }}
           onClick={() => p.setPreviewOpen(!p.previewOpen)}
@@ -1307,6 +1390,71 @@ const S: Record<string, CSSProperties> = {
     padding: "6px 12px",
     borderRadius: 6,
     cursor: "pointer",
+    color: C.textDim,
+  },
+  dropdownScrim: { position: "fixed", inset: 0, zIndex: 40 },
+  dropdown: {
+    position: "absolute",
+    top: "calc(100% + 4px)",
+    left: 0,
+    minWidth: 280,
+    maxWidth: 460,
+    background: C.panelAlt,
+    border: `1px solid ${C.border}`,
+    borderRadius: 8,
+    boxShadow: "0 12px 40px rgba(0,0,0,0.5)",
+    padding: 4,
+    zIndex: 50,
+  },
+  dropdownItem: {
+    display: "flex",
+    alignItems: "center",
+    width: "100%",
+    background: "transparent",
+    border: "none",
+    color: C.text,
+    padding: "7px 8px",
+    borderRadius: 6,
+    cursor: "pointer",
+    textAlign: "left",
+    fontSize: 12,
+  },
+  dropdownName: { fontWeight: 500, marginRight: 8, flexShrink: 0 },
+  dropdownPath: {
+    color: C.textFaint,
+    fontFamily: MONO,
+    fontSize: 11,
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  searchWrap: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    background: C.panelAlt,
+    border: `1px solid ${C.border}`,
+    borderRadius: 6,
+    padding: "4px 8px",
+    width: 200,
+  },
+  searchInput: {
+    flex: 1,
+    minWidth: 0,
+    background: "transparent",
+    border: "none",
+    outline: "none",
+    color: C.text,
+    fontFamily: MONO,
+    fontSize: 12,
+  },
+  searchClear: {
+    background: "transparent",
+    border: "none",
+    color: C.textFaint,
+    cursor: "pointer",
+    padding: 0,
+    fontSize: 11,
   },
   iconBtn: {
     background: "transparent",
