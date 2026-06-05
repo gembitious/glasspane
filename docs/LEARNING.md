@@ -422,7 +422,204 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ---
 
+## 10. 엔드투엔드 흐름 따라가기 — "폴더 클릭 → 썸네일이 뜬다"
+
+개념을 따로 외우기보다 **하나의 동작이 두 평면을 가로지르는 경로**를 추적하면 전체 그림이 한 번에 들어옵니다.
+
+```
+[사용자가 트리에서 폴더 클릭]
+        │  (프론트, App.tsx)
+        ▼
+1) listDir(path)  ──invoke("list_dir")──▶  Rust list_dir()         [데이터 평면]
+        │                                      │  fs::read_dir + 정렬
+        ◀───────────  Vec<DirEntry> (JSON) ─────┘
+        │  kind === "image"만 필터 → ImgRef[]로 매핑 → setNodeItems(...)
+        ▼
+2) 그리드 재계산 (App.tsx:476-484)
+        cols = floor((뷰포트너비 - GAP) / (tile + GAP))
+        firstRow/visibleRows로 보이는 행만 slice  ← 수동 가상화
+        ▼
+3) 보이는 타일마다 <Tile> → <img src={thumbUrl(item, thumbW)} loading="lazy">
+        │  thumbUrl()이 imgsrv://localhost/thumb?path=...&w=256 생성
+        ▼  (브라우저가 이미지 요청 발사)
+4) Rust 프로토콜 핸들러                                              [이미지 평면]
+        register_imgsrv → 워커 스레드 → handle_request → "/thumb" → serve_thumb
+        │  cache_key로 디스크 캐시 조회
+        │   ├─ 히트: 캐시된 JPEG 즉시 반환 (디코드 없음, permit 불필요)
+        │   └─ 미스: decode_sem().acquire() → read_source_bytes → make_thumb
+        │            (이미지 디코드 → thumbnail 리사이즈 → JPEG 인코드) → 캐시에 기록
+        ◀───────────  JPEG 바이트 (HTTP 200) ──────────┘
+        ▼
+5) <img> onLoad 발화 → loadedRef.add(id) + bumpLoad()  (App.tsx:734-736)
+        → opacity 0→1 페이드인 (.28s)  → 스켈레톤 위로 부드럽게 등장
+```
+
+스크롤하면 2)~5)가 **보이는 행에 대해서만** 반복됩니다. 이미 본 타일은 `loadedRef`에 기록돼 있어
+다시 그려질 때 즉시 표시(페이드인 생략)되고, 디스크 캐시 + 브라우저 캐시 덕에 재요청도 거의 공짜입니다.
+
+> 이 한 장의 흐름에 **invoke 평면 · 커스텀 프로토콜 평면 · 가상화 · 캐시 · 동시성 제한**이 전부 등장합니다.
+> 막히는 개념이 생기면 위 번호로 돌아와 해당 단계의 코드를 열어보세요.
+
+---
+
+## 11. 프론트엔드 깊게 보기 — 수동 가상화와 썸네일 로딩 (`App.tsx`)
+
+CLAUDE.md의 방침은 **무거운 그리드 라이브러리를 쓰지 않고 직접 가상화**하는 것입니다. 핵심은 의외로 짧습니다.
+
+### 11.1 수동 가상화 (App.tsx:476-484)
+```ts
+const cols = Math.max(1, Math.floor((viewport.w - GAP) / (tile + GAP)));  // 너비로 열 수 계산
+const rows = Math.ceil(items.length / cols);
+const totalH = rows * (cellH + GAP) + GAP;                                // 전체 높이(스페이서)
+
+const firstRow     = Math.max(0, Math.floor(scrollTop / (cellH + GAP)) - OVERSCAN_ROWS);
+const visibleRows  = Math.ceil(viewport.h / (cellH + GAP)) + OVERSCAN_ROWS * 2;
+const firstIdx     = firstRow * cols;
+const lastIdx      = Math.min(items.length, (firstRow + visibleRows) * cols);
+const visible      = items.slice(firstIdx, lastIdx);                      // 보이는 것 + 약간의 오버스캔만
+```
+- 컨테이너는 `height: totalH`인 **스페이서 div** 하나(App.tsx:713). 그 안에서 타일을 **절대 위치**로 배치:
+  ```ts
+  left: GAP + col * (tile + GAP),
+  top:  GAP + row * (cellH + GAP),
+  ```
+- 그래서 항목이 수천 개라도 **실제 DOM에는 보이는 행(+오버스캔)만** 존재 → 스크롤이 매끄럽습니다.
+- `scrollTop`은 `onScroll`로 state에 반영(App.tsx:698)되어 위 계산이 다시 돌고, 보이는 슬라이스가 갱신됩니다.
+
+**학습 포인트**: 가상화의 본질은 "전체 크기만큼 자리를 잡아두고(스페이서), 보이는 것만 그린다"입니다.
+react-window 같은 라이브러리도 내부적으로 같은 일을 합니다.
+
+### 11.2 썸네일 페이드인 + `loadedRef` (App.tsx:233, 726, 734, 1124-1136)
+```tsx
+<img
+  src={thumbUrl(item, thumbW)}
+  loading="lazy" decoding="async"     // 브라우저에게 지연/비동기 디코드 위임
+  onLoad={p.onLoaded}                 // 성공 → loadedRef.add(id) + 리렌더
+  onError={p.onBroken}                // 실패 → brokenRef.add(id) → 깨진-이미지 플레이스홀더
+  style={{ opacity: loaded ? 1 : 0, transition: "opacity .28s ease", /* ... */ }}
+/>
+```
+- `loadedRef`는 **`useRef<Set<string>>`** (state가 아님). 로드 여부는 렌더 사이에 보존돼야 하지만,
+  매 추가마다 리렌더를 유발하면 비효율적이라 `ref`에 담고 `bumpLoad()`로 **한 번만** 리렌더를 깨웁니다.
+  → "리렌더가 필요 없는 가변 값은 `ref`, UI에 반영돼야 하는 값은 `state`"라는 React 관용구의 좋은 예.
+- 노드를 바꾸면 `loadedRef.current = new Set()`로 초기화(App.tsx:316)하고 스크롤도 0으로(318).
+
+### 11.3 키보드 내비게이션 (App.tsx:498-511)
+- 뷰어가 열려 있을 때 `window`에 `keydown` 리스너를 달아 `←/→/Home/End/Esc`를 처리하고,
+  effect의 **클린업**에서 `removeEventListener`로 정리합니다(리스너 누수 방지 — React effect의 정석).
+- 줌 키(`+`/`-`/`0`)는 `Viewer` 컴포넌트 내부에서 별도 리스너로 처리(역할 분리). 휠 줌은 `preventDefault`가
+  필요해 **네이티브 비-passive 리스너**를 ref로 직접 부착합니다.
+
+---
+
+## 12. Rust 심화
+
+### 12.1 소유권 · 빌림 · 라이프타임 (이 코드에서)
+- **빌림(`&`)으로 소유권 보존**: `serve_thumb(app, &src, w)` — `src`를 빌려주므로 호출 후에도 `src`를 계속 씀.
+- **`move` 클로저로 소유권 이동**: `thread::spawn(move || { ... app ... })` — 스레드는 부모보다 오래 살 수 있어
+  값을 **소유**해야 함. 그래서 `app`을 `clone()`해 넘김.
+- **라이프타임 `'a`**: `struct Permit<'a>(&'a Semaphore)` — 허가 토큰이 빌린 세마포어보다 오래 살 수 없음을
+  타입으로 못 박음. 덕분에 "이미 사라진 세마포어에 반납" 같은 버그가 **컴파일 단계에서** 불가능.
+- **문자열 두 종류**: `&str`(빌린 뷰) vs `String`(소유). `ext_of(name: &str) -> String`처럼 입력은 싸게 빌리고
+  필요할 때만 소유 문자열을 만듭니다. `as_deref()`(`Option<String>`→`Option<&str>`), `to_string_lossy().into_owned()`
+  (OS 문자열→소유 `String`) 같은 변환도 같이 봐 두면 좋습니다.
+
+### 12.2 에러 처리 관용구
+- `Result<T, String>`를 명령 반환형으로 쓰면 `Err`가 프론트의 `Promise` reject로 전달돼 `try/catch`로 잡힙니다.
+- `?` 연산자는 "에러면 즉시 반환, 아니면 언랩". `map_err(|e| e.to_string())?`가 거의 모든 곳의 패턴.
+- `convert_images`는 **부분 실패 모델**: 개별 파일 실패를 `report.failed`에 모으고 전체는 `Ok`로 반환 →
+  "한 장 깨졌다고 배치 전체를 죽이지 않기". 에러 설계의 좋은 예시입니다.
+
+**`Option`/`Result` 콤비네이터 빠른 표** (코드에 다 등장):
+
+| 메서드 | 의미 | 코드 예 |
+|--------|------|---------|
+| `.map(f)` | 값이 있으면 변환 | `entry.metadata().map(meta_size_mtime)` |
+| `.and_then(f)` | 변환 결과가 또 `Option/Result` | `.and_then(\|e\| e.to_str())` |
+| `.unwrap_or(d)` | 없으면 기본값 | `.unwrap_or((0, 0))` |
+| `.ok()` | `Result`→`Option` | `.modified().ok()` |
+| `.map_err(f)` | 에러를 변환 | `.map_err(\|e\| e.to_string())` |
+| `?` | 에러 전파 | `fs::read_dir(&path)?` |
+
+### 12.3 `image` 크레이트 디코드 파이프라인 (`make_thumb`)
+```rust
+let img = ImageReader::new(Cursor::new(bytes))   // 메모리 바이트를 읽기 소스로
+    .with_guessed_format()?                       // 매직 바이트로 포맷 추론(확장자 불신)
+    .decode()?;                                   // DynamicImage로 디코드
+let thumb = img.thumbnail(w, w);                  // 종횡비 유지하며 w×w 안에 맞춤
+encode_jpeg(thumb)                                // RGB로 낮춰 JPEG 인코드(알파 제거)
+```
+- WebP는 순수 Rust, **AVIF는 `avif-native` 피처(libdav1d)** 로 디코드(§8.1). 피처를 빼면 AVIF만 폴백.
+- `/full` 경로는 webview가 직접 못 그리는 포맷(AVIF 등)만 `transcode_jpeg`로 변환하고, JPEG/PNG/WebP 등은
+  **원본 바이트를 그대로** 흘려보냅니다(`passthrough_content_type`).
+
+---
+
+## 13. Tauri 심화
+
+### 13.1 IPC는 실제로 어떻게 도나
+- `invoke("list_dir", { path })` → Tauri가 메시지를 코어로 전달 → `generate_handler!`가 만든 라우터가
+  `list_dir`를 찾아 인자를 **역직렬화**(serde) → 함수 실행 → 반환값을 **직렬화**해 프론트 `Promise`로 resolve.
+- 그래서 **인자/반환 타입은 `Serialize`/`Deserialize`여야** 하고, Rust↔JS 필드명은
+  serde `rename_all` 또는 Tauri의 자동 case 변환으로 맞춥니다.
+- **커스텀 프로토콜은 이 직렬화 파이프라인을 우회**합니다. 바이트를 JSON에 담지 않고 HTTP 응답처럼
+  스트리밍하므로 대용량 이미지에 적합 — 이게 두 평면을 나눈 이유의 핵심입니다.
+
+### 13.2 capability(권한) 모델
+- Tauri 2는 **명시적 권한**을 요구합니다. `capabilities/default.json`의 `permissions`에 없는 플러그인 명령은
+  프론트에서 호출해도 거부됩니다. dialog 플러그인을 쓰려면 `"dialog:allow-open"`이 있어야 합니다.
+- 반면 **우리가 `generate_handler!`로 등록한 앱 명령**(list_dir 등)은 권한 항목이 필요 없습니다.
+- 사고방식: "프론트(신뢰 못 함)가 네이티브 능력에 접근하려면, 그 능력이 capability로 *허가*되어 있어야 한다."
+
+### 13.3 dev vs build 파이프라인
+- `npm run tauri dev`: `beforeDevCommand`(Vite dev 서버) + Rust 디버그 빌드 → `devUrl`을 가리키는 창.
+  프론트 핫리로드, Rust 변경 시 재빌드.
+- `npm run tauri build`: `beforeBuildCommand`(= `npm run build`, 정적 `dist/` 생성) + Rust **릴리스** 빌드 +
+  번들러가 OS별 설치 패키지 생성. `frontendDist: "../dist"`가 그 정적 산출물을 가리킵니다.
+- 즉 **프로덕션 빌드는 로컬 서버 없이** 번들된 정적 자산을 webview가 로드합니다(개발 때만 Vite 서버 사용).
+
+---
+
+## 14. 함정 모음 (실제로 부딪히는 것들)
+
+CLAUDE.md §10 + 이 저장소에서 **직접 겪은** 사례를 묶었습니다.
+
+1. **CSP에 `imgsrv` 누락 → 이미지가 *조용히* 안 뜸.** 에러도 거의 없이 빈 칸만 보입니다.
+   `img-src`에 스킴을 넣었는지 가장 먼저 의심하세요.
+2. **프로토콜 origin이 플랫폼마다 다름.** Windows는 `http://imgsrv.localhost`, 그 외는 `imgsrv://localhost`.
+   `viewerApi.ts`가 UA로 분기 — 하드코딩 금지.
+3. **libdav1d 버전.** AVIF는 dav1d **≥ 1.3.0** 필요. **Ubuntu 22.04(0.9.2)에선 빌드 실패**, 24.04(1.4.x)는 OK.
+   ← *우리 CI 1차 실패의 실제 원인.* 러너를 24.04로 올려 해결.
+4. **clippy 버전 차이.** CI의 최신 stable clippy가 로컬(구버전)이 못 잡은 린트를 잡아 `-D warnings`로 실패할 수 있음.
+   ← *우리 CI 2차 실패(`unnecessary_sort_by`).* `rustup update stable`로 로컬을 맞추면 동일해집니다.
+5. **base64로 이미지 invoke 금지.** 메모리/IPC 폭발. 반드시 커스텀 프로토콜로.
+6. **큰 디렉터리에서 메타데이터 일괄 조회 금지.** 가상화 + lazy `<img>`로 *보이는 것만* 디코드하도록.
+7. **스레드 폭주 주의.** 프로토콜 핸들러는 요청마다 스레드를 띄움 → 동시 디코드는 세마포어로 캡(§4).
+
+---
+
+## 15. 용어집
+
+| 용어 | 뜻 |
+|------|----|
+| **invoke** | 프론트가 Rust 명령을 호출하는 IPC. JSON 직렬화, 요청→단일 응답. |
+| **custom (URI scheme) protocol** | `imgsrv://`처럼 직접 등록한 스킴. 바이트를 HTTP 응답처럼 스트리밍. |
+| **Channel** | 한 invoke 호출 동안 Rust→프론트로 **여러 번** 메시지를 흘리는 통로(진행률 등). |
+| **capability / permission** | 프론트가 쓸 수 있는 (플러그인) 명령을 허가하는 Tauri 2 보안 모델. |
+| **CSP** | Content-Security-Policy. webview가 로드 가능한 출처/스킴을 제한. |
+| **AppHandle** | 앱 전역 핸들. 경로 API(`app_cache_dir`), 이벤트 등 코어 기능 접근점. |
+| **virtualization(가상화)** | 보이는 항목만 DOM에 그려 대량 리스트를 가볍게 유지하는 기법. |
+| **overscan** | 뷰포트 밖이지만 미리 그려두는 여분 행(스크롤 시 깜빡임 방지). |
+| **RAII / `Drop`** | 자원을 값의 수명에 묶어, 스코프 종료 시 자동 정리(여기선 세마포어 허가 반납). |
+| **`OnceLock`** | 스레드 안전 1회 초기화. 전역 싱글턴 지연 생성에 사용. |
+| **passthrough** | 디코드/변환 없이 원본 바이트를 그대로 전달(webview-safe 포맷). |
+| **transcode** | webview가 못 그리는 포맷(AVIF 등)을 JPEG로 재인코드해 전달. |
+
+---
+
 ### 한 줄 요약
-- **데이터는 invoke(JSON), 이미지는 커스텀 프로토콜(바이트 스트림)** — 이 분리가 Tauri 설계의 정수.
-- Rust 핵심(`Result`+`?`, 소유권/빌림, 트레잇/`Drop`, `Mutex`/`Condvar`/`OnceLock` 동시성)이 이 한 앱에 다 들어있음.
-- 실행은 `npm run tauri dev`, 검증은 `npm run build` + `cargo fmt/clippy/check`, 패키징은 이미 완비(`tauri build` / 태그 푸시).
+- **데이터는 invoke(JSON), 이미지는 커스텀 프로토콜(바이트 스트림)** — 이 분리가 Tauri 설계의 정수(§0, §10).
+- **프론트는 수동 가상화 + `ref` 캐시(loadedRef)** 로 수천 장도 매끄럽게(§11).
+- Rust 핵심(`Result`+`?`, 소유권/빌림/라이프타임, 트레잇/`Drop`, `Mutex`/`Condvar`/`OnceLock` 동시성)이 이 한 앱에 다 들어있음(§4, §12).
+- 실행은 `npm run tauri dev`, 검증은 `npm run build` + `cargo fmt/clippy/check`, 패키징은 이미 완비(`tauri build` / 태그 푸시)(§8, §9).
+- 막히면 §10 흐름도로 돌아가 해당 단계 코드를 열고, 이상하면 §14 함정부터 의심.
