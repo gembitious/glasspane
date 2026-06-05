@@ -1577,6 +1577,10 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
   const movedRef = useRef(false);
+  // latest nav callbacks + a throttle so a trackpad flick doesn't skip pages
+  const navRef = useRef({ onPrev, onNext });
+  navRef.current = { onPrev, onNext };
+  const wheelLockRef = useRef(0);
 
   // reset zoom/pan whenever the displayed image changes
   useEffect(() => {
@@ -1590,17 +1594,27 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
     if (z === 1) setOffset({ x: 0, y: 0 });
   }, []);
 
-  // wheel zoom (native non-passive listener so we can preventDefault)
+  // Wheel: pages prev/next (Honeyview-style); Ctrl/⌘+wheel zooms.
+  // Native non-passive listener so we can preventDefault.
   useEffect(() => {
     const el = backdropRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      setZoom((prev) => {
-        const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, prev * (e.deltaY < 0 ? 1.15 : 0.87)));
-        if (z === 1) setOffset({ x: 0, y: 0 });
-        return z;
-      });
+      if (e.ctrlKey || e.metaKey) {
+        setZoom((prev) => {
+          const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, prev * (e.deltaY < 0 ? 1.15 : 0.87)));
+          if (z === 1) setOffset({ x: 0, y: 0 });
+          return z;
+        });
+        return;
+      }
+      if (Math.abs(e.deltaY) < 2) return;
+      const now = Date.now();
+      if (now - wheelLockRef.current < 120) return; // throttle rapid wheel events
+      wheelLockRef.current = now;
+      if (e.deltaY > 0) navRef.current.onNext();
+      else navRef.current.onPrev();
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
@@ -1644,16 +1658,6 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
       onMouseUp={endDrag}
       onMouseLeave={endDrag}
     >
-      <button
-        style={{ ...S.navBtn, left: 16 }}
-        onClick={(e) => {
-          e.stopPropagation();
-          onPrev();
-        }}
-      >
-        ‹
-      </button>
-
       <img
         src={fullUrl(item)}
         alt={item.name}
@@ -1675,16 +1679,6 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
           cursor: zoom > 1 ? (dragRef.current ? "grabbing" : "grab") : "default",
         }}
       />
-
-      <button
-        style={{ ...S.navBtn, right: 16 }}
-        onClick={(e) => {
-          e.stopPropagation();
-          onNext();
-        }}
-      >
-        ›
-      </button>
 
       <div style={S.viewerInfo} onClick={(e) => e.stopPropagation()}>
         <span style={{ fontFamily: MONO, color: C.textDim }}>
