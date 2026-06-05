@@ -76,7 +76,8 @@ still builds and AVIF files simply show a broken-thumbnail placeholder.
 | `Enter` / `F` | Open the active image fullscreen |
 
 **Fullscreen viewer:** `←` `→` navigate, `Home` `End` jump to first/last, `Esc` closes.
-The selected tile always scrolls into view as you move.
+Zoom with the scroll wheel or `+` / `-`, `0` (or double-click) resets; drag to pan when
+zoomed in. The selected tile always scrolls into view as you move.
 
 ## Building & releasing
 

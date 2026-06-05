@@ -1323,10 +1323,84 @@ interface ViewerProps {
   onClose: () => void;
 }
 
+const ZOOM_MIN = 1;
+const ZOOM_MAX = 8;
+
 function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerProps) {
   const pathLabel = crumbs.map((c) => c.name).join(" › ");
+  const backdropRef = useRef<HTMLDivElement | null>(null);
+
+  const [zoom, setZoom] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
+  const movedRef = useRef(false);
+
+  // reset zoom/pan whenever the displayed image changes
+  useEffect(() => {
+    setZoom(1);
+    setOffset({ x: 0, y: 0 });
+  }, [item.id]);
+
+  const applyZoom = useCallback((next: number) => {
+    const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, next));
+    setZoom(z);
+    if (z === 1) setOffset({ x: 0, y: 0 });
+  }, []);
+
+  // wheel zoom (native non-passive listener so we can preventDefault)
+  useEffect(() => {
+    const el = backdropRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      setZoom((prev) => {
+        const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, prev * (e.deltaY < 0 ? 1.15 : 0.87)));
+        if (z === 1) setOffset({ x: 0, y: 0 });
+        return z;
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // +/-/0 zoom keys (arrows/Esc/Home/End are handled by the grid-level handler)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "+" || e.key === "=") applyZoom(zoom + 0.25);
+      else if (e.key === "-" || e.key === "_") applyZoom(zoom - 0.25);
+      else if (e.key === "0") applyZoom(1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [zoom, applyZoom]);
+
+  const onMouseDown = (e: ReactMouseEvent) => {
+    if (zoom <= 1) return;
+    e.preventDefault();
+    movedRef.current = false;
+    dragRef.current = { x: e.clientX, y: e.clientY, ox: offset.x, oy: offset.y };
+  };
+  const onMouseMove = (e: ReactMouseEvent) => {
+    const d = dragRef.current;
+    if (!d) return;
+    movedRef.current = true;
+    setOffset({ x: d.ox + (e.clientX - d.x), y: d.oy + (e.clientY - d.y) });
+  };
+  const endDrag = () => {
+    dragRef.current = null;
+  };
+
   return (
-    <div style={S.viewerBackdrop} onClick={onClose}>
+    <div
+      ref={backdropRef}
+      style={S.viewerBackdrop}
+      onClick={() => {
+        if (!movedRef.current) onClose();
+      }}
+      onMouseMove={onMouseMove}
+      onMouseUp={endDrag}
+      onMouseLeave={endDrag}
+    >
       <button
         style={{ ...S.navBtn, left: 16 }}
         onClick={(e) => {
@@ -1340,14 +1414,23 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
       <img
         src={fullUrl(item)}
         alt={item.name}
+        draggable={false}
+        onClick={(e) => e.stopPropagation()}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          applyZoom(zoom > 1 ? 1 : 2);
+        }}
+        onMouseDown={onMouseDown}
         style={{
           maxWidth: "86vw",
           maxHeight: "82vh",
           objectFit: "contain",
           borderRadius: 8,
           boxShadow: "0 24px 80px rgba(0,0,0,0.6)",
+          transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
+          transition: dragRef.current ? "none" : "transform .12s ease-out",
+          cursor: zoom > 1 ? (dragRef.current ? "grabbing" : "grab") : "default",
         }}
-        onClick={(e) => e.stopPropagation()}
       />
 
       <button
@@ -1368,6 +1451,17 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
         <span style={{ fontFamily: MONO, color: C.textDim }}>
           {index + 1} / {total}
         </span>
+        <Sep />
+        <button
+          style={{ ...S.iconBtn, fontFamily: MONO }}
+          onClick={(e) => {
+            e.stopPropagation();
+            applyZoom(1);
+          }}
+          title="줌 초기화 (0)"
+        >
+          {Math.round(zoom * 100)}%
+        </button>
         <button style={{ ...S.iconBtn, marginLeft: 12 }} onClick={onClose} title="닫기 (Esc)">
           ✕
         </button>
