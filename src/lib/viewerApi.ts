@@ -18,10 +18,18 @@ export interface DirEntry {
   name: string;
   path: string;
   kind: EntryKind;
+  /** byte size from filesystem metadata (0 if unavailable) */
+  size: number;
+  /** modified time, seconds since the Unix epoch (0 if unavailable) */
+  mtime: number;
 }
 
 export interface ArchiveEntry {
   name: string;
+  /** uncompressed byte size of the entry */
+  size: number;
+  /** monotonic sort key from the entry's DOS date/time (not a true epoch) */
+  mtime: number;
 }
 
 export interface ImageMeta {
@@ -98,4 +106,35 @@ export function fullUrl(ref: ImgRef): string {
   params.set("path", ref.path);
   if (ref.archive) params.set("archive", ref.archive);
   return `${imgsrvOrigin()}/full?${params.toString()}`;
+}
+
+// ---------------------------------------------------------------------------
+// Batch conversion (decode -> re-encode)
+// ---------------------------------------------------------------------------
+
+export type ConvertFormat = "jpg" | "png" | "webp";
+
+export interface ConvertOpts {
+  format: ConvertFormat;
+  destDir: string;
+  /** JPEG quality 1–100; ignored for png/webp (lossless). */
+  quality?: number;
+  /** Overwrite existing files instead of adding a numeric suffix. */
+  overwrite?: boolean;
+}
+
+export interface ConvertFailure {
+  name: string;
+  error: string;
+}
+
+export interface ConvertReport {
+  ok: number;
+  failed: ConvertFailure[];
+  outputs: string[];
+}
+
+/** Convert images to `opts.format` in `opts.destDir`. */
+export function convertImages(refs: ImgRef[], opts: ConvertOpts): Promise<ConvertReport> {
+  return invoke<ConvertReport>("convert_images", { sources: refs.map(refToSrc), opts });
 }

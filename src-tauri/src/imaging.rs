@@ -31,11 +31,20 @@ pub struct DirEntry {
     pub path: String,
     /// "dir" | "archive" | "image"
     pub kind: String,
+    /// byte size from filesystem metadata (0 if unavailable)
+    pub size: u64,
+    /// modified time, seconds since the Unix epoch (0 if unavailable)
+    pub mtime: u64,
 }
 
 #[derive(Serialize)]
 pub struct ArchiveEntry {
     pub name: String,
+    /// uncompressed byte size of the entry
+    pub size: u64,
+    /// last-modified timestamp; a monotonic value suitable for sorting within
+    /// the archive (DOS time fields, not a true Unix epoch)
+    pub mtime: u64,
 }
 
 #[derive(Serialize)]
@@ -118,10 +127,13 @@ pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
             }
         };
 
+        let (size, mtime) = entry.metadata().map(meta_size_mtime).unwrap_or((0, 0));
         entries.push(DirEntry {
             name,
             path: entry.path().to_string_lossy().into_owned(),
             kind: kind.to_string(),
+            size,
+            mtime,
         });
     }
 
@@ -149,7 +161,9 @@ pub fn list_archive(path: String) -> Result<Vec<ArchiveEntry>, String> {
         }
         let name = entry.name().to_string();
         if is_image(&ext_of(&name)) {
-            out.push(ArchiveEntry { name });
+            let size = entry.size();
+            let mtime = entry.last_modified().map(zip_dt_sort_key).unwrap_or(0);
+            out.push(ArchiveEntry { name, size, mtime });
         }
     }
 
@@ -178,7 +192,7 @@ pub fn image_meta(src: Src) -> Result<ImageMeta, String> {
 // Reading source bytes (filesystem file or entry inside a zip)
 // ---------------------------------------------------------------------------
 
-fn read_source_bytes(src: &Src) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_source_bytes(src: &Src) -> std::io::Result<Vec<u8>> {
     match &src.archive {
         Some(zip_path) => {
             let file = fs::File::open(zip_path)?;
@@ -332,17 +346,32 @@ fn cache_key(src: &Src, w: u32) -> String {
 
 fn file_sig(path: &str) -> (u64, u64) {
     match fs::metadata(path) {
-        Ok(m) => {
-            let mtime = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            (m.len(), mtime)
-        }
+        Ok(m) => meta_size_mtime(m),
         Err(_) => (0, 0),
     }
+}
+
+/// `(size, mtime_secs)` from filesystem metadata; mtime is Unix-epoch seconds.
+fn meta_size_mtime(m: fs::Metadata) -> (u64, u64) {
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (m.len(), mtime)
+}
+
+/// A monotonic sort key from a zip entry's DOS date/time (not a Unix epoch,
+/// but ordering is correct for sorting entries within an archive).
+fn zip_dt_sort_key(dt: zip::DateTime) -> u64 {
+    let y = dt.year() as u64;
+    let mo = dt.month() as u64;
+    let d = dt.day() as u64;
+    let h = dt.hour() as u64;
+    let mi = dt.minute() as u64;
+    let s = dt.second() as u64;
+    ((((y * 13 + mo) * 32 + d) * 24 + h) * 60 + mi) * 60 + s
 }
 
 // ---------------------------------------------------------------------------
