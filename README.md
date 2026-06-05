@@ -16,7 +16,7 @@ Early development. The interactive UX prototype is in place; backend wiring
 
 - Frontend: React + TypeScript + Vite
 - Backend: Rust (Tauri 2)
-- Image decode: [`image`](https://crates.io/crates/image) (WebP is pure-Rust; AVIF via the `avif-native` feature / libdav1d)
+- Image decode: [`image`](https://crates.io/crates/image) (WebP is pure-Rust; AVIF via the opt-in `avif` feature / libdav1d)
 - Archives: [`zip`](https://crates.io/crates/zip) (reads entries without extracting)
 
 ## Architecture
@@ -56,14 +56,19 @@ npm run tauri build    # produce a release binary
 - The rest of the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/) for your OS
   (WebView, build tools).
 
-AVIF decoding additionally links the system **libdav1d** (≥ 1.3.0):
+**AVIF is opt-in.** The default build needs no extra system libraries and works everywhere
+(WebP/JPEG/PNG/GIF). AVIF decode links the system **libdav1d** (≥ 1.3.0) through pkg-config, so
+it's behind the `avif` cargo feature — enable it only where libdav1d is available:
 
-- Debian/Ubuntu: `sudo apt install libdav1d-dev` (needs 24.04+; 22.04 ships an older 0.9.x)
-- macOS: `brew install dav1d`
-- Windows: install `dav1d` via vcpkg
+```bash
+npm run tauri dev   -- --features avif
+npm run tauri build -- --features avif
+```
 
-If libdav1d is unavailable, drop the `avif-native` feature from `src-tauri/Cargo.toml`; the app
-still builds and AVIF files simply show a broken-thumbnail placeholder.
+- Debian/Ubuntu: `sudo apt install libdav1d-dev pkg-config` (needs 24.04+; 22.04 ships 0.9.x)
+- macOS: `brew install dav1d pkg-config`
+- Windows: provide `dav1d` via vcpkg (fiddly) — or just omit `--features avif`; AVIF files then
+  show a broken-thumbnail placeholder while everything else works.
 
 ## Keyboard shortcuts
 

@@ -49,7 +49,8 @@ It's built to fit one user's workflow — favor sharp, fast, focused behavior ov
 - **Frontend:** React + TypeScript + Vite
 - **Desktop shell + backend:** Tauri 2 (Rust)
 - **Image decode:** [`image`](https://crates.io/crates/image) crate — WebP is pure-Rust; AVIF
-  via the `avif-native` feature (pulls **libdav1d**, a C lib — now **enabled**, see §10).
+  via the **opt-in `avif` cargo feature** (= `image/avif-native`, pulls **libdav1d**, a C lib;
+  off by default so the build works without it — notably on Windows. See §10).
 - **Archives:** [`zip`](https://crates.io/crates/zip) crate — reads entries without extracting.
 - **Folder picker:** `tauri-plugin-dialog`.
 - **Window state:** `tauri-plugin-window-state` remembers window size/position across launches.
@@ -159,16 +160,20 @@ packaging (release build verified + `.github/workflows/release.yml` via `tauri-a
 
 ```toml
 serde = { version = "1", features = ["derive"] }
-image = { version = "0.25", features = ["avif-native"] }   # avif-native = AVIF decode via libdav1d (system C lib)
+image = { version = "0.25" }            # WebP/JPEG/PNG/GIF (pure Rust); AVIF behind the `avif` feature
 zip = "2"
 tauri-plugin-dialog = "2"               # native folder picker
+
+[features]
+default = []
+avif = ["image/avif-native"]            # opt-in AVIF decode (links system libdav1d via pkg-config)
 ```
 
-> The decode feature is **`avif-native`** (not `avif-decoder`); it pulls the `dav1d` crate,
-> which links the system **libdav1d** via pkg-config (build dep: `libdav1d-dev` on Debian/
-> Ubuntu, `brew install dav1d` on macOS, vcpkg on Windows). Without it `imaging.rs` still
-> builds — WebP/JPEG/PNG/GIF work and AVIF sources just error gracefully (broken-thumbnail
-> placeholder) — so the feature can be dropped if a target lacks libdav1d.
+> AVIF is an **opt-in feature** (`--features avif`), not on by default. `image/avif-native`
+> pulls the `dav1d` crate, which links the system **libdav1d** via pkg-config (build dep:
+> `libdav1d-dev` on Debian/Ubuntu, `brew install dav1d` on macOS, vcpkg on Windows). The
+> default build needs none of that — WebP/JPEG/PNG/GIF work and AVIF sources error gracefully
+> (broken-thumbnail placeholder) — so Windows and other libdav1d-less targets build out of the box.
 
 ### 7.2 `src-tauri/src/lib.rs`
 
@@ -290,10 +295,12 @@ Each task has an acceptance criterion (AC).
 - **Tauri 2.x API:** confirm the `register_asynchronous_uri_scheme_protocol` closure shape
   (`|ctx, request, responder|` → `responder.respond(http::Response…)`) against the installed
   Tauri version; adjust if it differs.
-- **AVIF:** **enabled** via the `avif-native` feature (links system **libdav1d** through
-  pkg-config). Build dep per OS: Debian/Ubuntu `libdav1d-dev`; macOS `brew install dav1d`;
-  Windows vcpkg. Confirmed building against libdav1d 1.4.1. Drop the feature if a target lacks
-  libdav1d (AVIF then falls back to a broken-thumbnail placeholder).
+- **AVIF:** **opt-in** via the `avif` cargo feature (`--features avif` → `image/avif-native`,
+  links system **libdav1d** through pkg-config). Build dep per OS: Debian/Ubuntu `libdav1d-dev`;
+  macOS `brew install dav1d`; Windows vcpkg (fiddly). Confirmed building against libdav1d 1.4.1.
+  The **default build omits it** so libdav1d-less targets (notably Windows) build out of the box;
+  AVIF then falls back to a broken-thumbnail placeholder. CI builds with `--features avif` (the
+  Linux runner has libdav1d); release enables it on the Linux bundle only.
 - **CSP:** must include the `imgsrv` scheme in `img-src` and the Google-Fonts hosts, or images
   and fonts silently fail to load.
 - **Protocol origin differs per platform** — handled in `viewerApi.ts` via a UA check; don't
