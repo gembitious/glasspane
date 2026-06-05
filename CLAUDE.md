@@ -121,6 +121,9 @@ packaging (release build verified + `.github/workflows/release.yml` via `tauri-a
 - `list_dir(path: String) -> Vec<DirEntry>`, `DirEntry = { name, path, kind: "dir"|"archive"|"image", size, mtime }`, sorted dirs-first then name (case-insensitive). `size`/`mtime` come from filesystem metadata (`mtime` = Unix-epoch seconds) and power size/date sort without decoding.
 - `list_archive(path: String) -> Vec<ArchiveEntry>`, `ArchiveEntry = { name, size, mtime }` — the image entries inside the zip (`mtime` is a monotonic DOS-time sort key, not a true epoch).
 - `image_meta(src: Src) -> ImageMeta`, `ImageMeta = { width, height, size }`.
+- `reveal_in_explorer(path: String) -> ()` — reveal a file in the OS file manager (Explorer
+  `/select`, macOS `open -R`, freedesktop `FileManager1`→`xdg-open` fallback). The frontend
+  passes the archive's path for zip entries.
 - `convert_images(sources: Vec<Src>, opts: ConvertOpts, onProgress: Channel<Progress>) -> ConvertReport`
   (in `convert.rs`) — decode each source and re-encode it into `opts.destDir`, streaming
   `Progress = { done, total, name }` over the channel as each file completes.
