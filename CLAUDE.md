@@ -137,7 +137,8 @@ packaging (release build verified + `.github/workflows/release.yml` via `tauri-a
 - `imgsrv://localhost/full?path=<...>[&archive=<zip>]` → full image bytes (original bytes for
   webview-safe formats; AVIF/exotic transcoded to JPEG so any webview can render them).
 - **Cache key** = container file `(size, mtime)` + inner entry name + `w`. Stored under the app
-  cache dir in `/thumbs`.
+  cache dir in `/thumbs`; pruned to a size budget (LRU by mtime) on startup in a background
+  thread so the cache can't grow without bound.
 - The frontend builds these URLs via `viewerApi.ts` (`thumbUrl`, `fullUrl`), which handles the
   per-platform origin (Windows: `http://imgsrv.localhost`; elsewhere: `imgsrv://localhost`).
 
@@ -301,6 +302,9 @@ Each task has an acceptance criterion (AC).
   the decode/encode path in `imaging.rs`; cache hits skip the permit. _(Done.)_
 - **Large directories:** rely on virtualization + lazy `<img>` so only visible thumbnails
   decode; don't eagerly fetch metadata for an entire listing.
+- **Zip reads:** parsed archives are cached (small LRU keyed by `(path, size, mtime)`) so
+  browsing a `.cbz` doesn't re-parse the central directory per entry; reads of the *same*
+  archive serialize on a per-archive lock, but that's cheap next to the (semaphore-capped) decode.
 - **This is a real app, not a chat artifact:** `localStorage`/persistent storage is fine here.
 
 ---
