@@ -209,6 +209,71 @@ pub fn image_meta(src: Src) -> Result<ImageMeta, String> {
     })
 }
 
+/// Reveal `path` in the OS file manager, selecting the file where the platform
+/// supports it. For zip entries the frontend passes the archive's own path.
+// Each platform arm ends in `return`; whichever arm is last for a given target
+// would otherwise trip needless_return.
+#[allow(clippy::needless_return)]
+#[tauri::command]
+pub fn reveal_in_explorer(path: String) -> Result<(), String> {
+    use std::process::Command;
+
+    #[cfg(target_os = "windows")]
+    {
+        // explorer.exe exits non-zero even on success, so don't check status.
+        Command::new("explorer")
+            .arg(format!("/select,{path}"))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .args(["-R", &path])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // Prefer the freedesktop FileManager1 interface (selects the file in
+        // Nautilus/Dolphin/Nemo); fall back to opening the containing folder.
+        let selected = Command::new("dbus-send")
+            .args([
+                "--session",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                &format!("array:string:file://{path}"),
+                "string:",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !selected {
+            let dir = Path::new(&path)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from(&path));
+            Command::new("xdg-open")
+                .arg(dir)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+    {
+        let _ = path;
+        Err("reveal is not supported on this platform".into())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reading source bytes (filesystem file or entry inside a zip)
 // ---------------------------------------------------------------------------

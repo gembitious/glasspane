@@ -27,6 +27,7 @@ import {
   thumbUrl,
   fullUrl,
   convertImages,
+  revealInExplorer,
   type DirEntry,
   type ImageMeta,
   type ConvertFormat,
@@ -1302,6 +1303,9 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
       setTimeout(() => setCopied(false), 1400);
     }
   };
+  const onReveal = () => {
+    if (item) revealInExplorer(item).catch(() => {});
+  };
   return (
     <aside style={S.preview}>
       <div style={{ ...S.paneHeader, display: "flex", alignItems: "center" }}>
@@ -1341,11 +1345,28 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
             <Meta label="크기" value={item.size ? fmtBytes(item.size) : meta ? fmtBytes(meta.size) : "…"} mono />
             <Meta label="경로" value={itemPath(item)} mono dim />
           </div>
-          <div style={{ padding: 12, borderTop: `1px solid ${C.borderSoft}`, display: "flex", gap: 8 }}>
-            <button style={{ ...S.ghostBtn, flex: 1 }} onClick={onCopyPath} title="이미지 경로 복사">
-              {copied ? "복사됨!" : "경로 복사"}
-            </button>
-            <button style={{ ...S.primaryBtn, flex: 1 }} onClick={onOpenFull}>
+          <div
+            style={{
+              padding: 12,
+              borderTop: `1px solid ${C.borderSoft}`,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div style={{ display: "flex", gap: 8 }}>
+              <button style={{ ...S.ghostBtn, flex: 1 }} onClick={onCopyPath} title="이미지 경로 복사">
+                {copied ? "복사됨!" : "경로 복사"}
+              </button>
+              <button
+                style={{ ...S.ghostBtn, flex: 1 }}
+                onClick={onReveal}
+                title="파일 탐색기에서 보기"
+              >
+                탐색기에서 보기
+              </button>
+            </div>
+            <button style={{ ...S.primaryBtn, width: "100%" }} onClick={onOpenFull}>
               전체화면 열기
             </button>
           </div>

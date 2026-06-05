@@ -18,6 +18,7 @@ pub fn run() {
             imaging::list_dir,
             imaging::list_archive,
             imaging::image_meta,
+            imaging::reveal_in_explorer,
             convert::convert_images
         ])
         .run(tauri::generate_context!())

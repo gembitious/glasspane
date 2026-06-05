@@ -79,6 +79,11 @@ function refToSrc(ref: ImgRef): Src {
   return ref.archive ? { archive: ref.archive, path: ref.path } : { path: ref.path };
 }
 
+/** Reveal the item in the OS file manager (the archive file for zip entries). */
+export function revealInExplorer(ref: ImgRef): Promise<void> {
+  return invoke<void>("reveal_in_explorer", { path: ref.archive ?? ref.path });
+}
+
 // ---------------------------------------------------------------------------
 // Image-bytes plane — imgsrv:// URL builders
 // ---------------------------------------------------------------------------
