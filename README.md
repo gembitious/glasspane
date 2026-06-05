@@ -79,6 +79,12 @@ still builds and AVIF files simply show a broken-thumbnail placeholder.
 Zoom with the scroll wheel or `+` / `-`, `0` (or double-click) resets; drag to pan when
 zoomed in. The selected tile always scrolls into view as you move.
 
+## Other niceties
+
+- **Drag and drop** a folder or `.zip`/`.cbz` onto the window to open it.
+- **Copy path** of the selected image from the preview panel.
+- The **window size and position are remembered** across launches.
+
 ## Building & releasing
 
 ```bash
