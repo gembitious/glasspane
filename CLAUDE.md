@@ -52,6 +52,7 @@ It's built to fit one user's workflow — favor sharp, fast, focused behavior ov
   via the `avif-native` feature (pulls **libdav1d**, a C lib — now **enabled**, see §10).
 - **Archives:** [`zip`](https://crates.io/crates/zip) crate — reads entries without extracting.
 - **Folder picker:** `tauri-plugin-dialog`.
+- **Window state:** `tauri-plugin-window-state` remembers window size/position across launches.
 - **(optional) persist last folder:** `tauri-plugin-store`.
 
 Rationale: Tauri → tiny/fast binary (the "lightweight" goal); Rust does fast off-thread decode

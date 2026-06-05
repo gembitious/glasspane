@@ -6,6 +6,7 @@ pub fn run() {
     let builder = imaging::register_imgsrv(tauri::Builder::default());
     builder
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             // Trim the on-disk thumbnail cache in the background so a long-lived
             // cache can't grow without bound; never blocks startup.
