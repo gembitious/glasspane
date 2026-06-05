@@ -90,6 +90,7 @@ type KnownFormat = (typeof KNOWN_FORMATS)[number];
 const ROOT_KEY = "glasspane.root";
 const RECENT_KEY = "glasspane.recent";
 const RECENT_MAX = 8;
+const PREFS_KEY = "glasspane.prefs";
 
 // ---------------------------------------------------------------------------
 // Path / format helpers
@@ -166,6 +167,28 @@ function loadRecent(): string[] {
   }
 }
 
+interface UiPrefs {
+  thumbSize: ThumbSizeKey;
+  sortKey: SortKey;
+  previewOpen: boolean;
+}
+
+function loadPrefs(): UiPrefs {
+  const fallback: UiPrefs = { thumbSize: "M", sortKey: "name", previewOpen: true };
+  try {
+    const v = JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}");
+    return {
+      thumbSize: v.thumbSize in TILE ? v.thumbSize : fallback.thumbSize,
+      sortKey: ["name", "format", "size", "date"].includes(v.sortKey) ? v.sortKey : fallback.sortKey,
+      previewOpen: typeof v.previewOpen === "boolean" ? v.previewOpen : fallback.previewOpen,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+const initialPrefs = loadPrefs();
+
 export default function App() {
   const [rootPath, setRootPath] = useState<string | null>(() => localStorage.getItem(ROOT_KEY));
   const [recent, setRecent] = useState<string[]>(loadRecent);
@@ -185,12 +208,16 @@ export default function App() {
   const [cursorId, setCursorId] = useState<string | null>(null);
   const anchorRef = useRef<string | null>(null);
 
-  // toolbar
-  const [thumbSize, setThumbSize] = useState<ThumbSizeKey>("M");
-  const [sortKey, setSortKey] = useState<SortKey>("name");
+  // toolbar (size / sort / preview persist across sessions)
+  const [thumbSize, setThumbSize] = useState<ThumbSizeKey>(() => initialPrefs.thumbSize);
+  const [sortKey, setSortKey] = useState<SortKey>(() => initialPrefs.sortKey);
   const [activeFormats, setActiveFormats] = useState<Set<KnownFormat>>(new Set(KNOWN_FORMATS));
-  const [previewOpen, setPreviewOpen] = useState(true);
+  const [previewOpen, setPreviewOpen] = useState(() => initialPrefs.previewOpen);
   const [query, setQuery] = useState("");
+
+  useEffect(() => {
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ thumbSize, sortKey, previewOpen }));
+  }, [thumbSize, sortKey, previewOpen]);
 
   // viewer
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
@@ -1487,6 +1514,7 @@ function ConvertDialog({ selected, all, onClose }: ConvertDialogProps) {
   const [overwrite, setOverwrite] = useState(false);
   const [destDir, setDestDir] = useState("");
   const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [report, setReport] = useState<ConvertReport | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -1502,13 +1530,18 @@ function ConvertDialog({ selected, all, onClose }: ConvertDialogProps) {
     setRunning(true);
     setError(null);
     setReport(null);
+    setProgress({ done: 0, total: sources.length });
     try {
-      const r = await convertImages(sources, {
-        format,
-        destDir,
-        quality: format === "jpg" ? quality : undefined,
-        overwrite,
-      });
+      const r = await convertImages(
+        sources,
+        {
+          format,
+          destDir,
+          quality: format === "jpg" ? quality : undefined,
+          overwrite,
+        },
+        (p) => setProgress({ done: p.done, total: p.total }),
+      );
       setReport(r);
     } catch (e) {
       setError(String(e));
@@ -1638,7 +1671,9 @@ function ConvertDialog({ selected, all, onClose }: ConvertDialogProps) {
             onClick={run}
             disabled={!destDir || running}
           >
-            {running ? "변환 중…" : `변환 시작 (${sources.length})`}
+            {running
+              ? `변환 중… ${progress ? `${progress.done}/${progress.total}` : ""}`
+              : `변환 시작 (${sources.length})`}
           </button>
         </div>
       </div>

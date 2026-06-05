@@ -12,8 +12,17 @@ use std::path::{Path, PathBuf};
 
 use image::{ExtendedColorType, ImageEncoder, ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
+use tauri::ipc::Channel;
 
 use crate::imaging::{read_source_bytes, Src};
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Progress {
+    pub done: u32,
+    pub total: u32,
+    pub name: String,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,13 +50,18 @@ pub struct ConvertReport {
 }
 
 #[tauri::command]
-pub fn convert_images(sources: Vec<Src>, opts: ConvertOpts) -> Result<ConvertReport, String> {
+pub fn convert_images(
+    sources: Vec<Src>,
+    opts: ConvertOpts,
+    on_progress: Channel<Progress>,
+) -> Result<ConvertReport, String> {
     let ext = normalize_ext(&opts.format)?;
     let dir = Path::new(&opts.dest_dir);
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
 
     let quality = opts.quality.unwrap_or(90).clamp(1, 100);
     let overwrite = opts.overwrite.unwrap_or(false);
+    let total = sources.len() as u32;
 
     let mut report = ConvertReport {
         ok: 0,
@@ -55,7 +69,7 @@ pub fn convert_images(sources: Vec<Src>, opts: ConvertOpts) -> Result<ConvertRep
         outputs: Vec::new(),
     };
 
-    for src in &sources {
+    for (i, src) in sources.iter().enumerate() {
         match convert_one(src, &opts.format, ext, quality, dir, overwrite) {
             Ok(out) => {
                 report.ok += 1;
@@ -66,6 +80,11 @@ pub fn convert_images(sources: Vec<Src>, opts: ConvertOpts) -> Result<ConvertRep
                 error,
             }),
         }
+        let _ = on_progress.send(Progress {
+            done: i as u32 + 1,
+            total,
+            name: base_stem(&src.path),
+        });
     }
 
     Ok(report)

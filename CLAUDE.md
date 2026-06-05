@@ -119,8 +119,9 @@ packaging (release build verified + `.github/workflows/release.yml` via `tauri-a
 - `list_dir(path: String) -> Vec<DirEntry>`, `DirEntry = { name, path, kind: "dir"|"archive"|"image", size, mtime }`, sorted dirs-first then name (case-insensitive). `size`/`mtime` come from filesystem metadata (`mtime` = Unix-epoch seconds) and power size/date sort without decoding.
 - `list_archive(path: String) -> Vec<ArchiveEntry>`, `ArchiveEntry = { name, size, mtime }` — the image entries inside the zip (`mtime` is a monotonic DOS-time sort key, not a true epoch).
 - `image_meta(src: Src) -> ImageMeta`, `ImageMeta = { width, height, size }`.
-- `convert_images(sources: Vec<Src>, opts: ConvertOpts) -> ConvertReport` (in `convert.rs`) —
-  decode each source and re-encode it into `opts.destDir`.
+- `convert_images(sources: Vec<Src>, opts: ConvertOpts, onProgress: Channel<Progress>) -> ConvertReport`
+  (in `convert.rs`) — decode each source and re-encode it into `opts.destDir`, streaming
+  `Progress = { done, total, name }` over the channel as each file completes.
   `ConvertOpts = { format: "jpg"|"png"|"webp", destDir, quality?, overwrite? }`
   (JPEG honors `quality`; PNG/WebP are lossless). `ConvertReport = { ok, failed: [{name, error}], outputs }`.
 - `Src = { archive?: string, path: string }` — if `archive` is set, `path` is the **entry name

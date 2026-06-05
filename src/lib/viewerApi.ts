@@ -6,7 +6,7 @@
 //
 // Keep these contracts in sync with src-tauri/src/imaging.rs.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 
 // ---------------------------------------------------------------------------
 // Types (mirror the Rust structs)
@@ -134,7 +134,23 @@ export interface ConvertReport {
   outputs: string[];
 }
 
-/** Convert images to `opts.format` in `opts.destDir`. */
-export function convertImages(refs: ImgRef[], opts: ConvertOpts): Promise<ConvertReport> {
-  return invoke<ConvertReport>("convert_images", { sources: refs.map(refToSrc), opts });
+export interface ConvertProgress {
+  done: number;
+  total: number;
+  name: string;
+}
+
+/** Convert images to `opts.format` in `opts.destDir`, streaming progress. */
+export function convertImages(
+  refs: ImgRef[],
+  opts: ConvertOpts,
+  onProgress?: (p: ConvertProgress) => void,
+): Promise<ConvertReport> {
+  const channel = new Channel<ConvertProgress>();
+  if (onProgress) channel.onmessage = onProgress;
+  return invoke<ConvertReport>("convert_images", {
+    sources: refs.map(refToSrc),
+    opts,
+    onProgress: channel,
+  });
 }
