@@ -14,6 +14,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use image::{ImageFormat, ImageReader};
@@ -31,11 +32,20 @@ pub struct DirEntry {
     pub path: String,
     /// "dir" | "archive" | "image"
     pub kind: String,
+    /// byte size from filesystem metadata (0 if unavailable)
+    pub size: u64,
+    /// modified time, seconds since the Unix epoch (0 if unavailable)
+    pub mtime: u64,
 }
 
 #[derive(Serialize)]
 pub struct ArchiveEntry {
     pub name: String,
+    /// uncompressed byte size of the entry
+    pub size: u64,
+    /// last-modified timestamp; a monotonic value suitable for sorting within
+    /// the archive (DOS time fields, not a true Unix epoch)
+    pub mtime: u64,
 }
 
 #[derive(Serialize)]
@@ -118,10 +128,13 @@ pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
             }
         };
 
+        let (size, mtime) = entry.metadata().map(meta_size_mtime).unwrap_or((0, 0));
         entries.push(DirEntry {
             name,
             path: entry.path().to_string_lossy().into_owned(),
             kind: kind.to_string(),
+            size,
+            mtime,
         });
     }
 
@@ -149,11 +162,13 @@ pub fn list_archive(path: String) -> Result<Vec<ArchiveEntry>, String> {
         }
         let name = entry.name().to_string();
         if is_image(&ext_of(&name)) {
-            out.push(ArchiveEntry { name });
+            let size = entry.size();
+            let mtime = entry.last_modified().map(zip_dt_sort_key).unwrap_or(0);
+            out.push(ArchiveEntry { name, size, mtime });
         }
     }
 
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     Ok(out)
 }
 
@@ -178,12 +193,11 @@ pub fn image_meta(src: Src) -> Result<ImageMeta, String> {
 // Reading source bytes (filesystem file or entry inside a zip)
 // ---------------------------------------------------------------------------
 
-fn read_source_bytes(src: &Src) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_source_bytes(src: &Src) -> std::io::Result<Vec<u8>> {
     match &src.archive {
         Some(zip_path) => {
             let file = fs::File::open(zip_path)?;
-            let mut archive = zip::ZipArchive::new(file)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let mut archive = zip::ZipArchive::new(file).map_err(std::io::Error::other)?;
             let mut entry = archive
                 .by_name(&src.path)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
@@ -193,6 +207,52 @@ fn read_source_bytes(src: &Src) -> std::io::Result<Vec<u8>> {
         }
         None => fs::read(&src.path),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Decode concurrency limit
+// ---------------------------------------------------------------------------
+
+// The protocol handler spawns a thread per request, so a grid asking for many
+// thumbnails at once could run a huge number of concurrent decodes. A counting
+// semaphore (≈ available CPUs) caps how many decode at a time; extra threads
+// block briefly on `acquire` instead of thrashing CPU/memory.
+struct Semaphore {
+    permits: Mutex<usize>,
+    cv: Condvar,
+}
+
+struct Permit<'a>(&'a Semaphore);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        *self.0.permits.lock().unwrap() += 1;
+        self.0.cv.notify_one();
+    }
+}
+
+impl Semaphore {
+    fn acquire(&self) -> Permit<'_> {
+        let mut n = self.permits.lock().unwrap();
+        while *n == 0 {
+            n = self.cv.wait(n).unwrap();
+        }
+        *n -= 1;
+        Permit(self)
+    }
+}
+
+fn decode_sem() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let permits = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Semaphore {
+            permits: Mutex::new(permits),
+            cv: Condvar::new(),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -252,11 +312,14 @@ fn serve_thumb<R: Runtime>(
     let dir = thumbs_dir(app)?;
     let cache_path = dir.join(format!("{}.jpg", cache_key(src, w)));
 
-    // disk-cache hit
+    // disk-cache hit — cheap, no decode permit needed
     if let Ok(bytes) = fs::read(&cache_path) {
         return Ok((bytes, "image/jpeg"));
     }
 
+    // bound the number of concurrent decodes (the grid can request hundreds at
+    // once); the permit is held only for the read + decode + encode.
+    let _permit = decode_sem().acquire();
     let raw = read_source_bytes(src).map_err(|e| e.to_string())?;
     let thumb = make_thumb(&raw, w)?;
     let _ = fs::write(&cache_path, &thumb); // best-effort cache write
@@ -268,7 +331,10 @@ fn serve_full(src: &Src) -> Result<(Vec<u8>, &'static str), String> {
     match passthrough_content_type(&ext_of(&src.path)) {
         Some(ct) => Ok((raw, ct)),
         // AVIF / exotic formats: transcode so any webview can render them
-        None => Ok((transcode_jpeg(&raw)?, "image/jpeg")),
+        None => {
+            let _permit = decode_sem().acquire();
+            Ok((transcode_jpeg(&raw)?, "image/jpeg"))
+        }
     }
 }
 
@@ -332,17 +398,32 @@ fn cache_key(src: &Src, w: u32) -> String {
 
 fn file_sig(path: &str) -> (u64, u64) {
     match fs::metadata(path) {
-        Ok(m) => {
-            let mtime = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            (m.len(), mtime)
-        }
+        Ok(m) => meta_size_mtime(m),
         Err(_) => (0, 0),
     }
+}
+
+/// `(size, mtime_secs)` from filesystem metadata; mtime is Unix-epoch seconds.
+fn meta_size_mtime(m: fs::Metadata) -> (u64, u64) {
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (m.len(), mtime)
+}
+
+/// A monotonic sort key from a zip entry's DOS date/time (not a Unix epoch,
+/// but ordering is correct for sorting entries within an archive).
+fn zip_dt_sort_key(dt: zip::DateTime) -> u64 {
+    let y = dt.year() as u64;
+    let mo = dt.month() as u64;
+    let d = dt.day() as u64;
+    let h = dt.hour() as u64;
+    let mi = dt.minute() as u64;
+    let s = dt.second() as u64;
+    ((((y * 13 + mo) * 32 + d) * 24 + h) * 60 + mi) * 60 + s
 }
 
 // ---------------------------------------------------------------------------
@@ -371,18 +452,16 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                    (Some(h), Some(l)) => {
-                        out.push(h * 16 + l);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' if i + 2 < bytes.len() => match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h * 16 + l);
+                    i += 3;
                 }
-            }
+                _ => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
             b'+' => {
                 out.push(b' ');
                 i += 1;

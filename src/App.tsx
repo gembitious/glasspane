@@ -15,6 +15,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -24,8 +25,11 @@ import {
   imageMeta,
   thumbUrl,
   fullUrl,
+  convertImages,
   type DirEntry,
   type ImageMeta,
+  type ConvertFormat,
+  type ConvertReport,
 } from "./lib/viewerApi";
 import "./App.css";
 
@@ -59,7 +63,7 @@ const MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, monospace';
 // ---------------------------------------------------------------------------
 
 type NodeKind = "dir" | "archive";
-type SortKey = "name" | "format" | "size";
+type SortKey = "name" | "format" | "size" | "date";
 type ThumbSizeKey = "S" | "M" | "L";
 
 /** A grid item — a superset of viewerApi's ImgRef plus UI-only fields. */
@@ -69,6 +73,8 @@ interface Item {
   path: string;
   archive?: string;
   fmt: string;
+  size: number;
+  mtime: number;
 }
 
 const TILE: Record<ThumbSizeKey, number> = { S: 120, M: 168, L: 232 };
@@ -81,11 +87,10 @@ const OVERSCAN_ROWS = 3;
 const KNOWN_FORMATS = ["webp", "avif", "jpg", "png", "gif"] as const;
 type KnownFormat = (typeof KNOWN_FORMATS)[number];
 
-// Size-sort fetches metadata lazily; above this many items it's skipped to
-// avoid decoding a whole huge directory just to sort (see CLAUDE.md §10).
-const SIZE_SORT_LIMIT = 4000;
-
 const ROOT_KEY = "glasspane.root";
+const RECENT_KEY = "glasspane.recent";
+const RECENT_MAX = 8;
+const PREFS_KEY = "glasspane.prefs";
 
 // ---------------------------------------------------------------------------
 // Path / format helpers
@@ -153,8 +158,40 @@ function breadcrumb(root: string, sel: string, selKind: NodeKind): Crumb[] {
 // App
 // ===========================================================================
 
+function loadRecent(): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]");
+    return Array.isArray(v) ? (v.filter((x) => typeof x === "string") as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+interface UiPrefs {
+  thumbSize: ThumbSizeKey;
+  sortKey: SortKey;
+  previewOpen: boolean;
+}
+
+function loadPrefs(): UiPrefs {
+  const fallback: UiPrefs = { thumbSize: "M", sortKey: "name", previewOpen: true };
+  try {
+    const v = JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}");
+    return {
+      thumbSize: v.thumbSize in TILE ? v.thumbSize : fallback.thumbSize,
+      sortKey: ["name", "format", "size", "date"].includes(v.sortKey) ? v.sortKey : fallback.sortKey,
+      previewOpen: typeof v.previewOpen === "boolean" ? v.previewOpen : fallback.previewOpen,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+const initialPrefs = loadPrefs();
+
 export default function App() {
   const [rootPath, setRootPath] = useState<string | null>(() => localStorage.getItem(ROOT_KEY));
+  const [recent, setRecent] = useState<string[]>(loadRecent);
 
   // tree state
   const [dirCache, setDirCache] = useState<Record<string, DirEntry[]>>({});
@@ -167,16 +204,26 @@ export default function App() {
   const [nodeItems, setNodeItems] = useState<Item[]>([]);
   const [gridLoading, setGridLoading] = useState(false);
   const [gridError, setGridError] = useState<string | null>(null);
-  const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [cursorId, setCursorId] = useState<string | null>(null);
+  const anchorRef = useRef<string | null>(null);
 
-  // toolbar
-  const [thumbSize, setThumbSize] = useState<ThumbSizeKey>("M");
-  const [sortKey, setSortKey] = useState<SortKey>("name");
+  // toolbar (size / sort / preview persist across sessions)
+  const [thumbSize, setThumbSize] = useState<ThumbSizeKey>(() => initialPrefs.thumbSize);
+  const [sortKey, setSortKey] = useState<SortKey>(() => initialPrefs.sortKey);
   const [activeFormats, setActiveFormats] = useState<Set<KnownFormat>>(new Set(KNOWN_FORMATS));
-  const [previewOpen, setPreviewOpen] = useState(true);
+  const [previewOpen, setPreviewOpen] = useState(() => initialPrefs.previewOpen);
+  const [query, setQuery] = useState("");
+
+  useEffect(() => {
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ thumbSize, sortKey, previewOpen }));
+  }, [thumbSize, sortKey, previewOpen]);
 
   // viewer
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+
+  // batch convert
+  const [convertOpen, setConvertOpen] = useState(false);
 
   // metadata cache (preview + size sort); null = fetched-but-failed/unknown
   const metaRef = useRef<Record<string, ImageMeta | null>>({});
@@ -216,17 +263,25 @@ export default function App() {
   // Open root folder
   // -------------------------------------------------------------------------
 
-  const pickFolder = useCallback(async () => {
-    const picked = await openDialog({ directory: true, multiple: false });
-    if (typeof picked !== "string") return;
+  const openRoot = useCallback((picked: string) => {
     setRootPath(picked);
     localStorage.setItem(ROOT_KEY, picked);
+    setRecent((prev) => {
+      const next = [picked, ...prev.filter((p) => p !== picked)].slice(0, RECENT_MAX);
+      localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+      return next;
+    });
     // reset everything tied to the previous root
     setDirCache({});
     setArchiveCount({});
     setExpanded(new Set([picked]));
     setSelected({ path: picked, kind: "dir" });
   }, []);
+
+  const pickFolder = useCallback(async () => {
+    const picked = await openDialog({ directory: true, multiple: false });
+    if (typeof picked === "string") openRoot(picked);
+  }, [openRoot]);
 
   // expand root + select it on first mount when a root was persisted
   useEffect(() => {
@@ -252,8 +307,11 @@ export default function App() {
     let cancelled = false;
     setGridLoading(true);
     setGridError(null);
-    setSelectedItemId(null);
+    setSelectedIds(new Set());
+    setCursorId(null);
+    anchorRef.current = null;
     setViewerIndex(null);
+    setQuery("");
     metaRef.current = {};
     loadedRef.current = new Set();
     brokenRef.current = new Set();
@@ -273,6 +331,8 @@ export default function App() {
             path: e.name,
             archive: selected.path,
             fmt: fmtOf(e.name),
+            size: e.size,
+            mtime: e.mtime,
           }));
         } else {
           const entries = await ensureDir(selected.path);
@@ -284,6 +344,8 @@ export default function App() {
               name: e.name,
               path: e.path,
               fmt: fmtOf(e.name),
+              size: e.size,
+              mtime: e.mtime,
             }));
         }
         if (!cancelled) setNodeItems(items);
@@ -308,7 +370,9 @@ export default function App() {
   // -------------------------------------------------------------------------
 
   const items = useMemo(() => {
+    const q = query.trim().toLowerCase();
     const filtered = nodeItems.filter((it) => {
+      if (q && !it.name.toLowerCase().includes(q)) return false;
       const known = (KNOWN_FORMATS as readonly string[]).includes(it.fmt);
       return known ? activeFormats.has(it.fmt as KnownFormat) : true;
     });
@@ -319,21 +383,53 @@ export default function App() {
           return a.name.localeCompare(b.name);
         case "format":
           return a.fmt.localeCompare(b.fmt) || a.name.localeCompare(b.name);
-        case "size": {
-          const sa = metaRef.current[a.id]?.size ?? -1;
-          const sb = metaRef.current[b.id]?.size ?? -1;
-          return sb - sa || a.name.localeCompare(b.name);
-        }
+        case "size":
+          return b.size - a.size || a.name.localeCompare(b.name);
+        case "date":
+          return b.mtime - a.mtime || a.name.localeCompare(b.name);
       }
     });
     return sorted;
-    // metaTick keeps the size-sort fresh as metadata streams in
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeItems, activeFormats, sortKey, metaTick]);
+  }, [nodeItems, activeFormats, sortKey, query]);
 
+  // the "active" item drives the preview and is the base for keyboard moves
   const selectedItem = useMemo(
-    () => items.find((it) => it.id === selectedItemId) ?? null,
-    [items, selectedItemId],
+    () => items.find((it) => it.id === cursorId) ?? null,
+    [items, cursorId],
+  );
+
+  const selectedItems = useMemo(
+    () => items.filter((it) => selectedIds.has(it.id)),
+    [items, selectedIds],
+  );
+
+  // click selection with ctrl/cmd (toggle) and shift (range) modifiers
+  const selectItem = useCallback(
+    (id: string, mods: { ctrl: boolean; shift: boolean }) => {
+      setCursorId(id);
+      if (mods.shift && anchorRef.current) {
+        const a = items.findIndex((it) => it.id === anchorRef.current);
+        const b = items.findIndex((it) => it.id === id);
+        if (a >= 0 && b >= 0) {
+          const [lo, hi] = a < b ? [a, b] : [b, a];
+          setSelectedIds(new Set(items.slice(lo, hi + 1).map((it) => it.id)));
+          return;
+        }
+      }
+      if (mods.ctrl) {
+        setSelectedIds((prev) => {
+          const next = new Set(prev);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        });
+        anchorRef.current = id;
+        return;
+      }
+      setSelectedIds(new Set([id]));
+      anchorRef.current = id;
+    },
+    [items],
   );
 
   // -------------------------------------------------------------------------
@@ -353,43 +449,11 @@ export default function App() {
       .finally(() => setMetaTick((v) => v + 1));
   }, []);
 
-  // preview metadata for the selected item
+  // preview metadata (resolution) for the active item; size/date come from the
+  // listing, so sorting never needs to decode anything.
   useEffect(() => {
     if (selectedItem) fetchMeta(selectedItem);
   }, [selectedItem, fetchMeta]);
-
-  // size sort: stream metadata for the whole (reasonably-sized) listing
-  useEffect(() => {
-    if (sortKey !== "size" || nodeItems.length === 0 || nodeItems.length > SIZE_SORT_LIMIT) return;
-    let cancelled = false;
-    const queue = nodeItems.filter((it) => !(it.id in metaRef.current));
-    let i = 0;
-    let active = 0;
-
-    const pump = () => {
-      while (!cancelled && active < 6 && i < queue.length) {
-        const it = queue[i++];
-        active++;
-        metaRef.current[it.id] = null;
-        imageMeta(it)
-          .then((m) => {
-            if (!cancelled) metaRef.current[it.id] = m;
-          })
-          .catch(() => {})
-          .finally(() => {
-            active--;
-            if (!cancelled) {
-              setMetaTick((v) => v + 1);
-              pump();
-            }
-          });
-      }
-    };
-    pump();
-    return () => {
-      cancelled = true;
-    };
-  }, [sortKey, nodeItems]);
 
   // -------------------------------------------------------------------------
   // Virtualization
@@ -446,6 +510,85 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [viewerIndex, items.length]);
 
+  // keep a grid index visible by nudging the scroll container
+  const scrollIndexIntoView = useCallback(
+    (index: number) => {
+      const el = gridRef.current;
+      if (!el) return;
+      const top = GAP + Math.floor(index / cols) * (cellH + GAP);
+      if (top < el.scrollTop) el.scrollTop = top - GAP;
+      else if (top + cellH > el.scrollTop + el.clientHeight)
+        el.scrollTop = top + cellH - el.clientHeight + GAP;
+      setScrollTop(el.scrollTop);
+    },
+    [cols, cellH],
+  );
+
+  // grid keyboard navigation (active only when the fullscreen viewer is closed)
+  useEffect(() => {
+    if (viewerIndex !== null || items.length === 0) return;
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (document.activeElement?.tagName ?? "").toLowerCase();
+      if (tag === "input" || tag === "textarea") return;
+
+      const cur = cursorId ? items.findIndex((it) => it.id === cursorId) : -1;
+      const pageRows = Math.max(1, Math.floor(viewport.h / (cellH + GAP)));
+      const last = items.length - 1;
+      const clamp = (n: number) => Math.max(0, Math.min(last, n));
+      let next = cur;
+
+      // Ctrl/Cmd+A selects everything
+      if ((e.ctrlKey || e.metaKey) && (e.key === "a" || e.key === "A")) {
+        e.preventDefault();
+        setSelectedIds(new Set(items.map((it) => it.id)));
+        return;
+      }
+
+      switch (e.key) {
+        case "ArrowRight":
+          next = cur < 0 ? 0 : clamp(cur + 1);
+          break;
+        case "ArrowLeft":
+          next = cur < 0 ? 0 : clamp(cur - 1);
+          break;
+        case "ArrowDown":
+          next = cur < 0 ? 0 : clamp(cur + cols);
+          break;
+        case "ArrowUp":
+          next = cur < 0 ? 0 : clamp(cur - cols);
+          break;
+        case "Home":
+          next = 0;
+          break;
+        case "End":
+          next = last;
+          break;
+        case "PageDown":
+          next = cur < 0 ? 0 : clamp(cur + pageRows * cols);
+          break;
+        case "PageUp":
+          next = cur < 0 ? 0 : clamp(cur - pageRows * cols);
+          break;
+        case "Enter":
+        case "f":
+        case "F":
+          if (cur >= 0) {
+            e.preventDefault();
+            openViewer(items[cur].id);
+          }
+          return;
+        default:
+          return;
+      }
+      e.preventDefault();
+      // Shift+move extends the range from the anchor; a plain move resets it
+      selectItem(items[next].id, { ctrl: false, shift: e.shiftKey });
+      scrollIndexIntoView(next);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [viewerIndex, items, cursorId, cols, cellH, viewport.h, openViewer, scrollIndexIntoView, selectItem]);
+
   // -------------------------------------------------------------------------
   // Tree interactions
   // -------------------------------------------------------------------------
@@ -491,6 +634,7 @@ export default function App() {
 
   // touch loadTick so the grid re-renders as thumbnails load / fail
   void loadTick;
+  void metaTick;
 
   return (
     <div style={S.app}>
@@ -499,7 +643,11 @@ export default function App() {
       <Toolbar
         crumbs={crumbs}
         onPickFolder={pickFolder}
+        recent={recent}
+        onPickRecent={openRoot}
         onCrumb={selectNode}
+        query={query}
+        setQuery={setQuery}
         thumbSize={thumbSize}
         setThumbSize={setThumbSize}
         sortKey={sortKey}
@@ -508,6 +656,8 @@ export default function App() {
         toggleFormat={toggleFormat}
         previewOpen={previewOpen}
         setPreviewOpen={setPreviewOpen}
+        canConvert={items.length > 0}
+        onOpenConvert={() => setConvertOpen(true)}
       />
 
       <div style={S.body}>
@@ -553,7 +703,11 @@ export default function App() {
             <div style={S.empty}>불러오는 중…</div>
           ) : items.length === 0 ? (
             <div style={S.empty}>
-              {selected ? "이 위치에 표시할 이미지가 없습니다." : "폴더 또는 zip을 선택하세요."}
+              {!selected
+                ? "폴더 또는 zip을 선택하세요."
+                : query.trim()
+                  ? `"${query.trim()}"에 해당하는 이미지가 없습니다.`
+                  : "이 위치에 표시할 이미지가 없습니다."}
             </div>
           ) : (
             <div style={{ position: "relative", height: totalH, width: "100%" }}>
@@ -571,8 +725,11 @@ export default function App() {
                     top={GAP + row * (cellH + GAP)}
                     loaded={loadedRef.current.has(it.id)}
                     broken={brokenRef.current.has(it.id)}
-                    selected={it.id === selectedItemId}
-                    onSelect={() => setSelectedItemId(it.id)}
+                    selected={selectedIds.has(it.id)}
+                    cursor={it.id === cursorId}
+                    onSelect={(e) =>
+                      selectItem(it.id, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
+                    }
                     onOpen={() => openViewer(it.id)}
                     onLoaded={() => {
                       loadedRef.current.add(it.id);
@@ -602,6 +759,7 @@ export default function App() {
 
       <StatusBar
         count={items.length}
+        selectedCount={selectedIds.size}
         nodeName={selectedNodeName}
         sortKey={sortKey}
         selectedName={selectedItem?.name ?? null}
@@ -620,6 +778,14 @@ export default function App() {
             setViewerIndex((i) => (i === null ? i : Math.min(items.length - 1, i + 1)))
           }
           onClose={() => setViewerIndex(null)}
+        />
+      )}
+
+      {convertOpen && (
+        <ConvertDialog
+          selected={selectedItems}
+          all={items}
+          onClose={() => setConvertOpen(false)}
         />
       )}
     </div>
@@ -649,7 +815,11 @@ function TitleBar() {
 interface ToolbarProps {
   crumbs: Crumb[];
   onPickFolder: () => void;
+  recent: string[];
+  onPickRecent: (path: string) => void;
   onCrumb: (path: string, kind: NodeKind) => void;
+  query: string;
+  setQuery: (s: string) => void;
   thumbSize: ThumbSizeKey;
   setThumbSize: (s: ThumbSizeKey) => void;
   sortKey: SortKey;
@@ -658,15 +828,50 @@ interface ToolbarProps {
   toggleFormat: (f: KnownFormat) => void;
   previewOpen: boolean;
   setPreviewOpen: (b: boolean) => void;
+  canConvert: boolean;
+  onOpenConvert: () => void;
 }
 
 function Toolbar(p: ToolbarProps) {
+  const [recentOpen, setRecentOpen] = useState(false);
   return (
     <div style={S.toolbarWrap}>
       <div style={S.toolbarRow}>
         <button style={S.primaryBtn} onClick={p.onPickFolder} title="폴더를 선택해 트리 루트로 엽니다">
           폴더 열기
         </button>
+        <div style={{ position: "relative" }}>
+          <button
+            style={{ ...S.ghostBtn, opacity: p.recent.length ? 1 : 0.5 }}
+            disabled={!p.recent.length}
+            onClick={() => setRecentOpen((v) => !v)}
+            title="최근 연 폴더"
+          >
+            최근 ▾
+          </button>
+          {recentOpen && p.recent.length > 0 && (
+            <>
+              <div style={S.dropdownScrim} onClick={() => setRecentOpen(false)} />
+              <div style={S.dropdown}>
+                {p.recent.map((path) => (
+                  <button
+                    key={path}
+                    style={S.dropdownItem}
+                    title={path}
+                    onClick={() => {
+                      setRecentOpen(false);
+                      p.onPickRecent(path);
+                    }}
+                  >
+                    <span style={{ marginRight: 6 }}>📁</span>
+                    <span style={S.dropdownName}>{baseName(path) || path}</span>
+                    <span style={S.dropdownPath}>{path}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
         <div style={S.crumbs}>
           {p.crumbs.map((c, i) => (
             <span key={c.path} style={{ display: "inline-flex", alignItems: "center" }}>
@@ -682,6 +887,20 @@ function Toolbar(p: ToolbarProps) {
           ))}
         </div>
         <div style={{ flex: 1 }} />
+        <div style={S.searchWrap}>
+          <span style={{ color: C.textFaint, fontSize: 12 }}>🔎</span>
+          <input
+            style={S.searchInput}
+            value={p.query}
+            placeholder="파일명 검색…"
+            onChange={(e) => p.setQuery(e.currentTarget.value)}
+          />
+          {p.query && (
+            <button style={S.searchClear} onClick={() => p.setQuery("")} title="지우기">
+              ✕
+            </button>
+          )}
+        </div>
         <button
           style={{ ...S.ghostBtn, color: p.previewOpen ? C.accent : C.textDim }}
           onClick={() => p.setPreviewOpen(!p.previewOpen)}
@@ -731,16 +950,26 @@ function Toolbar(p: ToolbarProps) {
 
         <span style={{ ...S.toolLabel, marginLeft: 16 }}>정렬</span>
         <div style={S.segment}>
-          {(["name", "format", "size"] as SortKey[]).map((s) => (
+          {(["name", "format", "size", "date"] as SortKey[]).map((s) => (
             <button
               key={s}
               style={{ ...S.segBtn, ...(p.sortKey === s ? S.segBtnOn : null) }}
               onClick={() => p.setSortKey(s)}
             >
-              {s === "name" ? "이름" : s === "format" ? "형식" : "크기"}
+              {s === "name" ? "이름" : s === "format" ? "형식" : s === "size" ? "크기" : "날짜"}
             </button>
           ))}
         </div>
+
+        <div style={{ flex: 1 }} />
+        <button
+          style={{ ...S.ghostBtn, opacity: p.canConvert ? 1 : 0.5 }}
+          disabled={!p.canConvert}
+          onClick={p.onOpenConvert}
+          title="이미지를 jpg/png/webp로 변환"
+        >
+          변환…
+        </button>
       </div>
     </div>
   );
@@ -854,14 +1083,15 @@ interface TileProps {
   loaded: boolean;
   broken: boolean;
   selected: boolean;
-  onSelect: () => void;
+  cursor: boolean;
+  onSelect: (e: ReactMouseEvent) => void;
   onOpen: () => void;
   onLoaded: () => void;
   onBroken: () => void;
 }
 
 function Tile(p: TileProps) {
-  const { item, tile, thumbW, left, top, loaded, broken, selected } = p;
+  const { item, tile, thumbW, left, top, loaded, broken, selected, cursor } = p;
   return (
     <div
       style={{ position: "absolute", left, top, width: tile, height: tile + LABEL_H }}
@@ -878,7 +1108,11 @@ function Tile(p: TileProps) {
           background: C.skeleton,
           outline: selected ? `2px solid ${C.ring}` : `1px solid ${C.border}`,
           outlineOffset: selected ? 0 : -1,
-          boxShadow: selected ? `0 0 0 4px ${C.accentSoft}` : "none",
+          boxShadow: cursor
+            ? `0 0 0 4px ${C.accentSoft}`
+            : selected
+              ? `0 0 0 2px ${C.accentSoft}`
+              : "none",
         }}
       >
         {broken ? (
@@ -1002,7 +1236,7 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
             <Meta label="이름" value={item.name} mono />
             <Meta label="형식" value={item.fmt.toUpperCase()} />
             <Meta label="해상도" value={meta ? `${meta.width} × ${meta.height}` : "…"} mono />
-            <Meta label="크기" value={meta ? fmtBytes(meta.size) : "…"} mono />
+            <Meta label="크기" value={item.size ? fmtBytes(item.size) : meta ? fmtBytes(meta.size) : "…"} mono />
             <Meta label="경로" value={item.archive ? `${item.archive} › ${item.path}` : item.path} mono dim />
           </div>
           <div style={{ padding: 12, borderTop: `1px solid ${C.borderSoft}` }}>
@@ -1057,6 +1291,7 @@ function Meta({
 
 interface StatusProps {
   count: number;
+  selectedCount: number;
   nodeName: string | null;
   sortKey: SortKey;
   selectedName: string | null;
@@ -1064,8 +1299,9 @@ interface StatusProps {
   rows: number;
 }
 
-function StatusBar({ count, nodeName, sortKey, selectedName, cols, rows }: StatusProps) {
-  const sortLabel = sortKey === "name" ? "이름" : sortKey === "format" ? "형식" : "크기";
+function StatusBar({ count, selectedCount, nodeName, sortKey, selectedName, cols, rows }: StatusProps) {
+  const sortLabel =
+    sortKey === "name" ? "이름" : sortKey === "format" ? "형식" : sortKey === "size" ? "크기" : "날짜";
   return (
     <div style={S.statusBar}>
       <Stat>{count.toLocaleString()} 이미지</Stat>
@@ -1074,7 +1310,13 @@ function StatusBar({ count, nodeName, sortKey, selectedName, cols, rows }: Statu
       <Sep />
       <Stat>정렬: {sortLabel}</Stat>
       <div style={{ flex: 1 }} />
-      {selectedName && (
+      {selectedCount > 1 && (
+        <>
+          <Stat mono>{selectedCount}개 선택</Stat>
+          <Sep />
+        </>
+      )}
+      {selectedCount <= 1 && selectedName && (
         <>
           <Stat mono>{selectedName}</Stat>
           <Sep />
@@ -1108,10 +1350,84 @@ interface ViewerProps {
   onClose: () => void;
 }
 
+const ZOOM_MIN = 1;
+const ZOOM_MAX = 8;
+
 function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerProps) {
   const pathLabel = crumbs.map((c) => c.name).join(" › ");
+  const backdropRef = useRef<HTMLDivElement | null>(null);
+
+  const [zoom, setZoom] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
+  const movedRef = useRef(false);
+
+  // reset zoom/pan whenever the displayed image changes
+  useEffect(() => {
+    setZoom(1);
+    setOffset({ x: 0, y: 0 });
+  }, [item.id]);
+
+  const applyZoom = useCallback((next: number) => {
+    const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, next));
+    setZoom(z);
+    if (z === 1) setOffset({ x: 0, y: 0 });
+  }, []);
+
+  // wheel zoom (native non-passive listener so we can preventDefault)
+  useEffect(() => {
+    const el = backdropRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      setZoom((prev) => {
+        const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, prev * (e.deltaY < 0 ? 1.15 : 0.87)));
+        if (z === 1) setOffset({ x: 0, y: 0 });
+        return z;
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // +/-/0 zoom keys (arrows/Esc/Home/End are handled by the grid-level handler)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "+" || e.key === "=") applyZoom(zoom + 0.25);
+      else if (e.key === "-" || e.key === "_") applyZoom(zoom - 0.25);
+      else if (e.key === "0") applyZoom(1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [zoom, applyZoom]);
+
+  const onMouseDown = (e: ReactMouseEvent) => {
+    if (zoom <= 1) return;
+    e.preventDefault();
+    movedRef.current = false;
+    dragRef.current = { x: e.clientX, y: e.clientY, ox: offset.x, oy: offset.y };
+  };
+  const onMouseMove = (e: ReactMouseEvent) => {
+    const d = dragRef.current;
+    if (!d) return;
+    movedRef.current = true;
+    setOffset({ x: d.ox + (e.clientX - d.x), y: d.oy + (e.clientY - d.y) });
+  };
+  const endDrag = () => {
+    dragRef.current = null;
+  };
+
   return (
-    <div style={S.viewerBackdrop} onClick={onClose}>
+    <div
+      ref={backdropRef}
+      style={S.viewerBackdrop}
+      onClick={() => {
+        if (!movedRef.current) onClose();
+      }}
+      onMouseMove={onMouseMove}
+      onMouseUp={endDrag}
+      onMouseLeave={endDrag}
+    >
       <button
         style={{ ...S.navBtn, left: 16 }}
         onClick={(e) => {
@@ -1125,14 +1441,23 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
       <img
         src={fullUrl(item)}
         alt={item.name}
+        draggable={false}
+        onClick={(e) => e.stopPropagation()}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          applyZoom(zoom > 1 ? 1 : 2);
+        }}
+        onMouseDown={onMouseDown}
         style={{
           maxWidth: "86vw",
           maxHeight: "82vh",
           objectFit: "contain",
           borderRadius: 8,
           boxShadow: "0 24px 80px rgba(0,0,0,0.6)",
+          transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
+          transition: dragRef.current ? "none" : "transform .12s ease-out",
+          cursor: zoom > 1 ? (dragRef.current ? "grabbing" : "grab") : "default",
         }}
-        onClick={(e) => e.stopPropagation()}
       />
 
       <button
@@ -1153,9 +1478,204 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
         <span style={{ fontFamily: MONO, color: C.textDim }}>
           {index + 1} / {total}
         </span>
+        <Sep />
+        <button
+          style={{ ...S.iconBtn, fontFamily: MONO }}
+          onClick={(e) => {
+            e.stopPropagation();
+            applyZoom(1);
+          }}
+          title="줌 초기화 (0)"
+        >
+          {Math.round(zoom * 100)}%
+        </button>
         <button style={{ ...S.iconBtn, marginLeft: 12 }} onClick={onClose} title="닫기 (Esc)">
           ✕
         </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Batch convert dialog
+// ---------------------------------------------------------------------------
+
+interface ConvertDialogProps {
+  selected: Item[];
+  all: Item[];
+  onClose: () => void;
+}
+
+function ConvertDialog({ selected, all, onClose }: ConvertDialogProps) {
+  const [scope, setScope] = useState<"selected" | "all">(selected.length ? "selected" : "all");
+  const [format, setFormat] = useState<ConvertFormat>("jpg");
+  const [quality, setQuality] = useState(90);
+  const [overwrite, setOverwrite] = useState(false);
+  const [destDir, setDestDir] = useState("");
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+  const [report, setReport] = useState<ConvertReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const sources = scope === "selected" ? selected : all;
+
+  const pickDest = async () => {
+    const picked = await openDialog({ directory: true, multiple: false });
+    if (typeof picked === "string") setDestDir(picked);
+  };
+
+  const run = async () => {
+    if (!destDir || running) return;
+    setRunning(true);
+    setError(null);
+    setReport(null);
+    setProgress({ done: 0, total: sources.length });
+    try {
+      const r = await convertImages(
+        sources,
+        {
+          format,
+          destDir,
+          quality: format === "jpg" ? quality : undefined,
+          overwrite,
+        },
+        (p) => setProgress({ done: p.done, total: p.total }),
+      );
+      setReport(r);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div style={S.viewerBackdrop} onClick={running ? undefined : onClose}>
+      <div style={S.modal} onClick={(e) => e.stopPropagation()}>
+        <div style={S.modalHeader}>
+          <span style={{ flex: 1, fontWeight: 600 }}>이미지 변환</span>
+          <button style={S.iconBtn} onClick={onClose} disabled={running} title="닫기">
+            ✕
+          </button>
+        </div>
+
+        <div style={{ padding: 16, overflow: "auto" }}>
+          {/* scope */}
+          <div style={S.field}>
+            <span style={S.fieldLabel}>대상</span>
+            <div style={S.segment}>
+              <button
+                style={{
+                  ...S.segBtn,
+                  ...(scope === "selected" ? S.segBtnOn : null),
+                  opacity: selected.length ? 1 : 0.5,
+                }}
+                disabled={!selected.length}
+                onClick={() => setScope("selected")}
+              >
+                선택 이미지 {selected.length}개
+              </button>
+              <button
+                style={{ ...S.segBtn, ...(scope === "all" ? S.segBtnOn : null) }}
+                onClick={() => setScope("all")}
+              >
+                현재 목록 전체 {all.length}개
+              </button>
+            </div>
+          </div>
+
+          {/* format */}
+          <div style={S.field}>
+            <span style={S.fieldLabel}>형식</span>
+            <div style={S.segment}>
+              {(["jpg", "png", "webp"] as ConvertFormat[]).map((f) => (
+                <button
+                  key={f}
+                  style={{ ...S.segBtn, ...(format === f ? S.segBtnOn : null) }}
+                  onClick={() => setFormat(f)}
+                >
+                  {f.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* quality (jpg only) */}
+          <div style={{ ...S.field, opacity: format === "jpg" ? 1 : 0.4 }}>
+            <span style={S.fieldLabel}>품질</span>
+            <input
+              type="range"
+              min={1}
+              max={100}
+              value={quality}
+              disabled={format !== "jpg"}
+              onChange={(e) => setQuality(Number(e.currentTarget.value))}
+              style={{ flex: 1 }}
+            />
+            <span style={{ fontFamily: MONO, width: 32, textAlign: "right" }}>{quality}</span>
+          </div>
+          {format !== "jpg" && (
+            <div style={{ ...S.hint, marginTop: -4 }}>PNG/WebP는 무손실로 저장됩니다.</div>
+          )}
+
+          {/* destination */}
+          <div style={S.field}>
+            <span style={S.fieldLabel}>저장 위치</span>
+            <button style={S.ghostBtn} onClick={pickDest} disabled={running}>
+              폴더 선택…
+            </button>
+            <span style={{ ...S.dropdownPath, flex: 1 }} title={destDir}>
+              {destDir || "선택되지 않음"}
+            </span>
+          </div>
+
+          {/* overwrite */}
+          <label style={{ ...S.field, cursor: "pointer" }}>
+            <span style={S.fieldLabel}>덮어쓰기</span>
+            <input
+              type="checkbox"
+              checked={overwrite}
+              onChange={(e) => setOverwrite(e.currentTarget.checked)}
+            />
+            <span style={S.hint}>끄면 같은 이름은 _1, _2…로 저장</span>
+          </label>
+
+          {/* result */}
+          {error && <div style={{ ...S.hint, color: C.danger }}>오류: {error}</div>}
+          {report && (
+            <div style={S.reportBox}>
+              <div style={{ color: C.webp }}>성공 {report.ok}개</div>
+              {report.failed.length > 0 && (
+                <div style={{ color: C.danger, marginTop: 4 }}>
+                  실패 {report.failed.length}개
+                  <div style={{ maxHeight: 120, overflow: "auto", marginTop: 4 }}>
+                    {report.failed.map((f) => (
+                      <div key={f.name} style={{ fontFamily: MONO, fontSize: 11 }}>
+                        {baseName(f.name)}: {f.error}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div style={S.modalFooter}>
+          <button style={S.ghostBtn} onClick={onClose} disabled={running}>
+            {report ? "닫기" : "취소"}
+          </button>
+          <button
+            style={{ ...S.primaryBtn, opacity: !destDir || running ? 0.5 : 1 }}
+            onClick={run}
+            disabled={!destDir || running}
+          >
+            {running
+              ? `변환 중… ${progress ? `${progress.done}/${progress.total}` : ""}`
+              : `변환 시작 (${sources.length})`}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1236,6 +1756,71 @@ const S: Record<string, CSSProperties> = {
     padding: "6px 12px",
     borderRadius: 6,
     cursor: "pointer",
+    color: C.textDim,
+  },
+  dropdownScrim: { position: "fixed", inset: 0, zIndex: 40 },
+  dropdown: {
+    position: "absolute",
+    top: "calc(100% + 4px)",
+    left: 0,
+    minWidth: 280,
+    maxWidth: 460,
+    background: C.panelAlt,
+    border: `1px solid ${C.border}`,
+    borderRadius: 8,
+    boxShadow: "0 12px 40px rgba(0,0,0,0.5)",
+    padding: 4,
+    zIndex: 50,
+  },
+  dropdownItem: {
+    display: "flex",
+    alignItems: "center",
+    width: "100%",
+    background: "transparent",
+    border: "none",
+    color: C.text,
+    padding: "7px 8px",
+    borderRadius: 6,
+    cursor: "pointer",
+    textAlign: "left",
+    fontSize: 12,
+  },
+  dropdownName: { fontWeight: 500, marginRight: 8, flexShrink: 0 },
+  dropdownPath: {
+    color: C.textFaint,
+    fontFamily: MONO,
+    fontSize: 11,
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  searchWrap: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    background: C.panelAlt,
+    border: `1px solid ${C.border}`,
+    borderRadius: 6,
+    padding: "4px 8px",
+    width: 200,
+  },
+  searchInput: {
+    flex: 1,
+    minWidth: 0,
+    background: "transparent",
+    border: "none",
+    outline: "none",
+    color: C.text,
+    fontFamily: MONO,
+    fontSize: 12,
+  },
+  searchClear: {
+    background: "transparent",
+    border: "none",
+    color: C.textFaint,
+    cursor: "pointer",
+    padding: 0,
+    fontSize: 11,
   },
   iconBtn: {
     background: "transparent",
@@ -1348,6 +1933,42 @@ const S: Record<string, CSSProperties> = {
     padding: "0 16px",
     background: C.panel,
     borderTop: `1px solid ${C.border}`,
+    fontSize: 12,
+  },
+  modal: {
+    width: "min(92vw, 520px)",
+    maxHeight: "86vh",
+    display: "flex",
+    flexDirection: "column",
+    background: C.panel,
+    border: `1px solid ${C.border}`,
+    borderRadius: 10,
+    boxShadow: "0 24px 80px rgba(0,0,0,0.6)",
+    overflow: "hidden",
+  },
+  modalHeader: {
+    display: "flex",
+    alignItems: "center",
+    padding: "12px 16px",
+    borderBottom: `1px solid ${C.borderSoft}`,
+    fontSize: 14,
+  },
+  modalFooter: {
+    display: "flex",
+    justifyContent: "flex-end",
+    gap: 8,
+    padding: 12,
+    borderTop: `1px solid ${C.borderSoft}`,
+  },
+  field: { display: "flex", alignItems: "center", gap: 10, marginBottom: 14, minHeight: 28 },
+  fieldLabel: { width: 70, flexShrink: 0, color: C.textDim, fontSize: 12 },
+  hint: { color: C.textFaint, fontSize: 11, marginBottom: 14 },
+  reportBox: {
+    marginTop: 6,
+    padding: 10,
+    background: C.panelAlt,
+    border: `1px solid ${C.border}`,
+    borderRadius: 6,
     fontSize: 12,
   },
 };

@@ -59,10 +59,44 @@ links the system **libdav1d**:
 If libdav1d is unavailable, drop the `avif-native` feature from `src-tauri/Cargo.toml`; the app
 still builds and AVIF files simply show a broken-thumbnail placeholder.
 
+## Keyboard shortcuts
+
+**Thumbnail grid** (when the fullscreen viewer is closed):
+
+| Key | Action |
+| :-- | :-- |
+| `←` `→` | Move selection by one |
+| `↑` `↓` | Move selection by one row |
+| `PageUp` `PageDown` | Move selection by one page |
+| `Home` `End` | First / last image |
+| `Shift` + move | Extend the selection range |
+| `Ctrl/Cmd` + click | Toggle an image in the selection |
+| `Shift` + click | Select a range |
+| `Ctrl/Cmd` + `A` | Select all |
+| `Enter` / `F` | Open the active image fullscreen |
+
+**Fullscreen viewer:** `←` `→` navigate, `Home` `End` jump to first/last, `Esc` closes.
+Zoom with the scroll wheel or `+` / `-`, `0` (or double-click) resets; drag to pan when
+zoomed in. The selected tile always scrolls into view as you move.
+
+## Building & releasing
+
+```bash
+npm run tauri build              # release binary + native bundles for the host OS
+npm run tauri build -- --no-bundle   # release binary only (skips deb/AppImage/etc.)
+```
+
+Pushing a `v*` tag (or running the **release** workflow manually) builds bundles for
+macOS, Linux, and Windows via [`tauri-action`](.github/workflows/release.yml) and attaches
+them to a draft GitHub Release.
+
 ## Roadmap
 
 - [x] Wire the UI to real directories and archives
 - [x] Background thumbnail decode + on-disk cache
 - [x] AVIF decode (enable the `avif-native` feature)
-- [ ] Keyboard-first navigation polish
-- [ ] (later) batch export / convert module
+- [x] Keyboard-first navigation polish
+- [x] Filename search/filter + recent folders
+- [x] Batch export / convert module (jpg/png/webp)
+- [x] Multi-select + date/size sort
+- [x] Packaging (release build + CI release workflow)

@@ -75,8 +75,9 @@ Three artifacts already exist (provided in the repo by the user), **not yet wire
 Also provided: `README.md` and `.gitignore` for the repo root.
 
 **Done:** architecture decided; prototype, backend module, and bridge written; project
-scaffolded; UI wired to the backend ("**v3**", §9); AVIF decode enabled (`avif-native`).
-**Not done:** packaging.
+scaffolded; UI wired to the backend ("**v3**", §9); AVIF decode enabled (`avif-native`);
+post-v3 features (search/filter, recent folders, batch convert, multi-select, date sort);
+packaging (release build verified + `.github/workflows/release.yml` via `tauri-action`).
 
 ---
 
@@ -115,9 +116,14 @@ scaffolded; UI wired to the backend ("**v3**", §9); AVIF decode enabled (`avif-
 
 ### 6.2 invoke commands (Rust, in `imaging.rs`)
 
-- `list_dir(path: String) -> Vec<DirEntry>`, `DirEntry = { name, path, kind: "dir"|"archive"|"image" }`, sorted dirs-first then name (case-insensitive).
-- `list_archive(path: String) -> Vec<ArchiveEntry>`, `ArchiveEntry = { name }` — the image entries inside the zip.
+- `list_dir(path: String) -> Vec<DirEntry>`, `DirEntry = { name, path, kind: "dir"|"archive"|"image", size, mtime }`, sorted dirs-first then name (case-insensitive). `size`/`mtime` come from filesystem metadata (`mtime` = Unix-epoch seconds) and power size/date sort without decoding.
+- `list_archive(path: String) -> Vec<ArchiveEntry>`, `ArchiveEntry = { name, size, mtime }` — the image entries inside the zip (`mtime` is a monotonic DOS-time sort key, not a true epoch).
 - `image_meta(src: Src) -> ImageMeta`, `ImageMeta = { width, height, size }`.
+- `convert_images(sources: Vec<Src>, opts: ConvertOpts, onProgress: Channel<Progress>) -> ConvertReport`
+  (in `convert.rs`) — decode each source and re-encode it into `opts.destDir`, streaming
+  `Progress = { done, total, name }` over the channel as each file completes.
+  `ConvertOpts = { format: "jpg"|"png"|"webp", destDir, quality?, overwrite? }`
+  (JPEG honors `quality`; PNG/WebP are lossless). `ConvertReport = { ok, failed: [{name, error}], outputs }`.
 - `Src = { archive?: string, path: string }` — if `archive` is set, `path` is the **entry name
   inside that zip**; otherwise `path` is a **filesystem path**.
 
@@ -290,9 +296,9 @@ Each task has an acceptance criterion (AC).
   and fonts silently fail to load.
 - **Protocol origin differs per platform** — handled in `viewerApi.ts` via a UA check; don't
   hardcode one form.
-- **Thumbnail concurrency:** the protocol handler currently spawns a thread per request; a grid
-  asking for many thumbnails at once can spawn a lot of threads. Harden with a bounded worker
-  pool or a global semaphore (≈ `num_cpus`) around the decode. _(Optimization, not a blocker.)_
+- **Thumbnail concurrency:** the protocol handler spawns a thread per request. Concurrent
+  **decodes** are now capped by a global counting semaphore (≈ `available_parallelism`) around
+  the decode/encode path in `imaging.rs`; cache hits skip the permit. _(Done.)_
 - **Large directories:** rely on virtualization + lazy `<img>` so only visible thumbnails
   decode; don't eagerly fetch metadata for an entire listing.
 - **This is a real app, not a chat artifact:** `localStorage`/persistent storage is fine here.
@@ -302,12 +308,12 @@ Each task has an acceptance criterion (AC).
 ## 11. Roadmap (after v3)
 
 - ~~Enable AVIF decode (`avif-native` + libdav1d).~~ **Done.**
-- **Batch export / convert module** (deferred): right-click a selection / folder / zip → convert
-  to jpg/png/webp. Implement decode→encode in Rust. _(The user has an existing PyQt WebP→JPG
-  converter whose logic and UX are a useful reference, but here it's reimplemented in Rust.)_
-  Build it as an isolated **feature module**, not a plugin system.
-- Multi-select; date sort; configurable keybindings.
-- Recent folders; filename search/filter.
+- ~~**Batch export / convert module**: convert a selection / list → jpg/png/webp, decode→encode
+  in Rust as an isolated feature module (`convert.rs` + `convert_images`).~~ **Done.** (Reached
+  from the toolbar **변환…** button; JPEG quality is configurable, PNG/WebP are lossless.)
+- ~~Multi-select; date sort~~ **Done** (Ctrl/Cmd+click toggle, Shift+click range, Ctrl/Cmd+A
+  select-all; date sort uses listing `mtime`). Configurable keybindings still TODO.
+- ~~Recent folders; filename search/filter.~~ **Done.**
 - Optional: serve disk-cached thumbnails via the built-in `asset:` protocol
   (`convertFileSrc`) as an alternative to `imgsrv` for the thumbnail path (full images and
   zip-internal images still need `imgsrv`).
