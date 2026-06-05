@@ -19,6 +19,7 @@ import {
   type ReactNode,
 } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   listDir,
   listArchive,
@@ -88,6 +89,38 @@ const GAP = 12;
 // for numbered comic/zip pages). One reused Collator is cheap.
 const nameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 const byName = (a: string, b: string) => nameCollator.compare(a, b);
+
+// The displayed/copyable path for an item (zip entries show archive › entry).
+function itemPath(it: { archive?: string; path: string }): string {
+  return it.archive ? `${it.archive} › ${it.path}` : it.path;
+}
+
+// Copy text to the clipboard, falling back to execCommand where the async
+// Clipboard API is unavailable/blocked in the webview.
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fall through to legacy path */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
 const LABEL_H = 34;
 const OVERSCAN_ROWS = 3;
 
@@ -290,6 +323,40 @@ export default function App() {
     const picked = await openDialog({ directory: true, multiple: false });
     if (typeof picked === "string") openRoot(picked);
   }, [openRoot]);
+
+  // Open a dropped path: a folder becomes the new root; a .zip/.cbz opens with
+  // its parent as the root and the archive selected so its images load.
+  const openDropped = useCallback(
+    (path: string) => {
+      if (/\.(zip|cbz)$/i.test(path)) {
+        const parent = path.replace(/[\\/][^\\/]*$/, "");
+        openRoot(parent || path);
+        setSelected({ path, kind: "archive" });
+      } else {
+        openRoot(path);
+      }
+    },
+    [openRoot],
+  );
+
+  // Native drag-and-drop (Tauri delivers real filesystem paths).
+  const [dragOver, setDragOver] = useState(false);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    getCurrentWebview()
+      .onDragDropEvent((e) => {
+        if (e.payload.type === "over" || e.payload.type === "enter") setDragOver(true);
+        else if (e.payload.type === "leave") setDragOver(false);
+        else if (e.payload.type === "drop") {
+          setDragOver(false);
+          if (e.payload.paths.length) openDropped(e.payload.paths[0]);
+        }
+      })
+      .then((f) => {
+        unlisten = f;
+      });
+    return () => unlisten?.();
+  }, [openDropped]);
 
   // expand root + select it on first mount when a root was persisted
   useEffect(() => {
@@ -646,6 +713,25 @@ export default function App() {
 
   return (
     <div style={S.app}>
+      {dragOver && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 1000,
+            background: "rgba(10,12,16,0.62)",
+            border: `2px dashed ${C.accent}`,
+            display: "grid",
+            placeItems: "center",
+            pointerEvents: "none",
+            color: C.text,
+            fontFamily: MONO,
+            fontSize: 16,
+          }}
+        >
+          여기에 폴더 또는 zip을 놓아 열기
+        </div>
+      )}
       <TitleBar />
 
       <Toolbar
@@ -1208,6 +1294,14 @@ interface PreviewProps {
 }
 
 function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
+  const [copied, setCopied] = useState(false);
+  const onCopyPath = async () => {
+    if (!item) return;
+    if (await copyText(itemPath(item))) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1400);
+    }
+  };
   return (
     <aside style={S.preview}>
       <div style={{ ...S.paneHeader, display: "flex", alignItems: "center" }}>
@@ -1245,10 +1339,13 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
             <Meta label="형식" value={item.fmt.toUpperCase()} />
             <Meta label="해상도" value={meta ? `${meta.width} × ${meta.height}` : "…"} mono />
             <Meta label="크기" value={item.size ? fmtBytes(item.size) : meta ? fmtBytes(meta.size) : "…"} mono />
-            <Meta label="경로" value={item.archive ? `${item.archive} › ${item.path}` : item.path} mono dim />
+            <Meta label="경로" value={itemPath(item)} mono dim />
           </div>
-          <div style={{ padding: 12, borderTop: `1px solid ${C.borderSoft}` }}>
-            <button style={{ ...S.primaryBtn, width: "100%" }} onClick={onOpenFull}>
+          <div style={{ padding: 12, borderTop: `1px solid ${C.borderSoft}`, display: "flex", gap: 8 }}>
+            <button style={{ ...S.ghostBtn, flex: 1 }} onClick={onCopyPath} title="이미지 경로 복사">
+              {copied ? "복사됨!" : "경로 복사"}
+            </button>
+            <button style={{ ...S.primaryBtn, flex: 1 }} onClick={onOpenFull}>
               전체화면 열기
             </button>
           </div>
