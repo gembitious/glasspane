@@ -115,8 +115,8 @@ scaffolded; UI wired to the backend ("**v3**", §9); AVIF decode enabled (`avif-
 
 ### 6.2 invoke commands (Rust, in `imaging.rs`)
 
-- `list_dir(path: String) -> Vec<DirEntry>`, `DirEntry = { name, path, kind: "dir"|"archive"|"image" }`, sorted dirs-first then name (case-insensitive).
-- `list_archive(path: String) -> Vec<ArchiveEntry>`, `ArchiveEntry = { name }` — the image entries inside the zip.
+- `list_dir(path: String) -> Vec<DirEntry>`, `DirEntry = { name, path, kind: "dir"|"archive"|"image", size, mtime }`, sorted dirs-first then name (case-insensitive). `size`/`mtime` come from filesystem metadata (`mtime` = Unix-epoch seconds) and power size/date sort without decoding.
+- `list_archive(path: String) -> Vec<ArchiveEntry>`, `ArchiveEntry = { name, size, mtime }` — the image entries inside the zip (`mtime` is a monotonic DOS-time sort key, not a true epoch).
 - `image_meta(src: Src) -> ImageMeta`, `ImageMeta = { width, height, size }`.
 - `convert_images(sources: Vec<Src>, opts: ConvertOpts) -> ConvertReport` (in `convert.rs`) —
   decode each source and re-encode it into `opts.destDir`.
@@ -309,7 +309,8 @@ Each task has an acceptance criterion (AC).
 - ~~**Batch export / convert module**: convert a selection / list → jpg/png/webp, decode→encode
   in Rust as an isolated feature module (`convert.rs` + `convert_images`).~~ **Done.** (Reached
   from the toolbar **변환…** button; JPEG quality is configurable, PNG/WebP are lossless.)
-- Multi-select; date sort; configurable keybindings.
+- ~~Multi-select; date sort~~ **Done** (Ctrl/Cmd+click toggle, Shift+click range, Ctrl/Cmd+A
+  select-all; date sort uses listing `mtime`). Configurable keybindings still TODO.
 - ~~Recent folders; filename search/filter.~~ **Done.**
 - Optional: serve disk-cached thumbnails via the built-in `asset:` protocol
   (`convertFileSrc`) as an alternative to `imgsrv` for the thumbnail path (full images and

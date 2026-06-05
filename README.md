@@ -69,7 +69,11 @@ still builds and AVIF files simply show a broken-thumbnail placeholder.
 | `↑` `↓` | Move selection by one row |
 | `PageUp` `PageDown` | Move selection by one page |
 | `Home` `End` | First / last image |
-| `Enter` / `F` | Open the selected image fullscreen |
+| `Shift` + move | Extend the selection range |
+| `Ctrl/Cmd` + click | Toggle an image in the selection |
+| `Shift` + click | Select a range |
+| `Ctrl/Cmd` + `A` | Select all |
+| `Enter` / `F` | Open the active image fullscreen |
 
 **Fullscreen viewer:** `←` `→` navigate, `Home` `End` jump to first/last, `Esc` closes.
 The selected tile always scrolls into view as you move.
@@ -82,3 +86,4 @@ The selected tile always scrolls into view as you move.
 - [x] Keyboard-first navigation polish
 - [x] Filename search/filter + recent folders
 - [x] Batch export / convert module (jpg/png/webp)
+- [x] Multi-select + date/size sort

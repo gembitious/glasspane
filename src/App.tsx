@@ -15,6 +15,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -62,7 +63,7 @@ const MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, monospace';
 // ---------------------------------------------------------------------------
 
 type NodeKind = "dir" | "archive";
-type SortKey = "name" | "format" | "size";
+type SortKey = "name" | "format" | "size" | "date";
 type ThumbSizeKey = "S" | "M" | "L";
 
 /** A grid item — a superset of viewerApi's ImgRef plus UI-only fields. */
@@ -72,6 +73,8 @@ interface Item {
   path: string;
   archive?: string;
   fmt: string;
+  size: number;
+  mtime: number;
 }
 
 const TILE: Record<ThumbSizeKey, number> = { S: 120, M: 168, L: 232 };
@@ -83,10 +86,6 @@ const OVERSCAN_ROWS = 3;
 // Known formats that get filter chips; anything else always shows.
 const KNOWN_FORMATS = ["webp", "avif", "jpg", "png", "gif"] as const;
 type KnownFormat = (typeof KNOWN_FORMATS)[number];
-
-// Size-sort fetches metadata lazily; above this many items it's skipped to
-// avoid decoding a whole huge directory just to sort (see CLAUDE.md §10).
-const SIZE_SORT_LIMIT = 4000;
 
 const ROOT_KEY = "glasspane.root";
 const RECENT_KEY = "glasspane.recent";
@@ -182,7 +181,9 @@ export default function App() {
   const [nodeItems, setNodeItems] = useState<Item[]>([]);
   const [gridLoading, setGridLoading] = useState(false);
   const [gridError, setGridError] = useState<string | null>(null);
-  const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [cursorId, setCursorId] = useState<string | null>(null);
+  const anchorRef = useRef<string | null>(null);
 
   // toolbar
   const [thumbSize, setThumbSize] = useState<ThumbSizeKey>("M");
@@ -279,7 +280,9 @@ export default function App() {
     let cancelled = false;
     setGridLoading(true);
     setGridError(null);
-    setSelectedItemId(null);
+    setSelectedIds(new Set());
+    setCursorId(null);
+    anchorRef.current = null;
     setViewerIndex(null);
     setQuery("");
     metaRef.current = {};
@@ -301,6 +304,8 @@ export default function App() {
             path: e.name,
             archive: selected.path,
             fmt: fmtOf(e.name),
+            size: e.size,
+            mtime: e.mtime,
           }));
         } else {
           const entries = await ensureDir(selected.path);
@@ -312,6 +317,8 @@ export default function App() {
               name: e.name,
               path: e.path,
               fmt: fmtOf(e.name),
+              size: e.size,
+              mtime: e.mtime,
             }));
         }
         if (!cancelled) setNodeItems(items);
@@ -349,21 +356,53 @@ export default function App() {
           return a.name.localeCompare(b.name);
         case "format":
           return a.fmt.localeCompare(b.fmt) || a.name.localeCompare(b.name);
-        case "size": {
-          const sa = metaRef.current[a.id]?.size ?? -1;
-          const sb = metaRef.current[b.id]?.size ?? -1;
-          return sb - sa || a.name.localeCompare(b.name);
-        }
+        case "size":
+          return b.size - a.size || a.name.localeCompare(b.name);
+        case "date":
+          return b.mtime - a.mtime || a.name.localeCompare(b.name);
       }
     });
     return sorted;
-    // metaTick keeps the size-sort fresh as metadata streams in
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeItems, activeFormats, sortKey, metaTick, query]);
+  }, [nodeItems, activeFormats, sortKey, query]);
 
+  // the "active" item drives the preview and is the base for keyboard moves
   const selectedItem = useMemo(
-    () => items.find((it) => it.id === selectedItemId) ?? null,
-    [items, selectedItemId],
+    () => items.find((it) => it.id === cursorId) ?? null,
+    [items, cursorId],
+  );
+
+  const selectedItems = useMemo(
+    () => items.filter((it) => selectedIds.has(it.id)),
+    [items, selectedIds],
+  );
+
+  // click selection with ctrl/cmd (toggle) and shift (range) modifiers
+  const selectItem = useCallback(
+    (id: string, mods: { ctrl: boolean; shift: boolean }) => {
+      setCursorId(id);
+      if (mods.shift && anchorRef.current) {
+        const a = items.findIndex((it) => it.id === anchorRef.current);
+        const b = items.findIndex((it) => it.id === id);
+        if (a >= 0 && b >= 0) {
+          const [lo, hi] = a < b ? [a, b] : [b, a];
+          setSelectedIds(new Set(items.slice(lo, hi + 1).map((it) => it.id)));
+          return;
+        }
+      }
+      if (mods.ctrl) {
+        setSelectedIds((prev) => {
+          const next = new Set(prev);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        });
+        anchorRef.current = id;
+        return;
+      }
+      setSelectedIds(new Set([id]));
+      anchorRef.current = id;
+    },
+    [items],
   );
 
   // -------------------------------------------------------------------------
@@ -383,43 +422,11 @@ export default function App() {
       .finally(() => setMetaTick((v) => v + 1));
   }, []);
 
-  // preview metadata for the selected item
+  // preview metadata (resolution) for the active item; size/date come from the
+  // listing, so sorting never needs to decode anything.
   useEffect(() => {
     if (selectedItem) fetchMeta(selectedItem);
   }, [selectedItem, fetchMeta]);
-
-  // size sort: stream metadata for the whole (reasonably-sized) listing
-  useEffect(() => {
-    if (sortKey !== "size" || nodeItems.length === 0 || nodeItems.length > SIZE_SORT_LIMIT) return;
-    let cancelled = false;
-    const queue = nodeItems.filter((it) => !(it.id in metaRef.current));
-    let i = 0;
-    let active = 0;
-
-    const pump = () => {
-      while (!cancelled && active < 6 && i < queue.length) {
-        const it = queue[i++];
-        active++;
-        metaRef.current[it.id] = null;
-        imageMeta(it)
-          .then((m) => {
-            if (!cancelled) metaRef.current[it.id] = m;
-          })
-          .catch(() => {})
-          .finally(() => {
-            active--;
-            if (!cancelled) {
-              setMetaTick((v) => v + 1);
-              pump();
-            }
-          });
-      }
-    };
-    pump();
-    return () => {
-      cancelled = true;
-    };
-  }, [sortKey, nodeItems]);
 
   // -------------------------------------------------------------------------
   // Virtualization
@@ -497,11 +504,18 @@ export default function App() {
       const tag = (document.activeElement?.tagName ?? "").toLowerCase();
       if (tag === "input" || tag === "textarea") return;
 
-      const cur = selectedItemId ? items.findIndex((it) => it.id === selectedItemId) : -1;
+      const cur = cursorId ? items.findIndex((it) => it.id === cursorId) : -1;
       const pageRows = Math.max(1, Math.floor(viewport.h / (cellH + GAP)));
       const last = items.length - 1;
       const clamp = (n: number) => Math.max(0, Math.min(last, n));
       let next = cur;
+
+      // Ctrl/Cmd+A selects everything
+      if ((e.ctrlKey || e.metaKey) && (e.key === "a" || e.key === "A")) {
+        e.preventDefault();
+        setSelectedIds(new Set(items.map((it) => it.id)));
+        return;
+      }
 
       switch (e.key) {
         case "ArrowRight":
@@ -540,12 +554,13 @@ export default function App() {
           return;
       }
       e.preventDefault();
-      setSelectedItemId(items[next].id);
+      // Shift+move extends the range from the anchor; a plain move resets it
+      selectItem(items[next].id, { ctrl: false, shift: e.shiftKey });
       scrollIndexIntoView(next);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [viewerIndex, items, selectedItemId, cols, cellH, viewport.h, openViewer, scrollIndexIntoView]);
+  }, [viewerIndex, items, cursorId, cols, cellH, viewport.h, openViewer, scrollIndexIntoView, selectItem]);
 
   // -------------------------------------------------------------------------
   // Tree interactions
@@ -592,6 +607,7 @@ export default function App() {
 
   // touch loadTick so the grid re-renders as thumbnails load / fail
   void loadTick;
+  void metaTick;
 
   return (
     <div style={S.app}>
@@ -682,8 +698,11 @@ export default function App() {
                     top={GAP + row * (cellH + GAP)}
                     loaded={loadedRef.current.has(it.id)}
                     broken={brokenRef.current.has(it.id)}
-                    selected={it.id === selectedItemId}
-                    onSelect={() => setSelectedItemId(it.id)}
+                    selected={selectedIds.has(it.id)}
+                    cursor={it.id === cursorId}
+                    onSelect={(e) =>
+                      selectItem(it.id, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
+                    }
                     onOpen={() => openViewer(it.id)}
                     onLoaded={() => {
                       loadedRef.current.add(it.id);
@@ -713,6 +732,7 @@ export default function App() {
 
       <StatusBar
         count={items.length}
+        selectedCount={selectedIds.size}
         nodeName={selectedNodeName}
         sortKey={sortKey}
         selectedName={selectedItem?.name ?? null}
@@ -736,7 +756,7 @@ export default function App() {
 
       {convertOpen && (
         <ConvertDialog
-          selected={selectedItem}
+          selected={selectedItems}
           all={items}
           onClose={() => setConvertOpen(false)}
         />
@@ -903,13 +923,13 @@ function Toolbar(p: ToolbarProps) {
 
         <span style={{ ...S.toolLabel, marginLeft: 16 }}>정렬</span>
         <div style={S.segment}>
-          {(["name", "format", "size"] as SortKey[]).map((s) => (
+          {(["name", "format", "size", "date"] as SortKey[]).map((s) => (
             <button
               key={s}
               style={{ ...S.segBtn, ...(p.sortKey === s ? S.segBtnOn : null) }}
               onClick={() => p.setSortKey(s)}
             >
-              {s === "name" ? "이름" : s === "format" ? "형식" : "크기"}
+              {s === "name" ? "이름" : s === "format" ? "형식" : s === "size" ? "크기" : "날짜"}
             </button>
           ))}
         </div>
@@ -1036,14 +1056,15 @@ interface TileProps {
   loaded: boolean;
   broken: boolean;
   selected: boolean;
-  onSelect: () => void;
+  cursor: boolean;
+  onSelect: (e: ReactMouseEvent) => void;
   onOpen: () => void;
   onLoaded: () => void;
   onBroken: () => void;
 }
 
 function Tile(p: TileProps) {
-  const { item, tile, thumbW, left, top, loaded, broken, selected } = p;
+  const { item, tile, thumbW, left, top, loaded, broken, selected, cursor } = p;
   return (
     <div
       style={{ position: "absolute", left, top, width: tile, height: tile + LABEL_H }}
@@ -1060,7 +1081,11 @@ function Tile(p: TileProps) {
           background: C.skeleton,
           outline: selected ? `2px solid ${C.ring}` : `1px solid ${C.border}`,
           outlineOffset: selected ? 0 : -1,
-          boxShadow: selected ? `0 0 0 4px ${C.accentSoft}` : "none",
+          boxShadow: cursor
+            ? `0 0 0 4px ${C.accentSoft}`
+            : selected
+              ? `0 0 0 2px ${C.accentSoft}`
+              : "none",
         }}
       >
         {broken ? (
@@ -1184,7 +1209,7 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
             <Meta label="이름" value={item.name} mono />
             <Meta label="형식" value={item.fmt.toUpperCase()} />
             <Meta label="해상도" value={meta ? `${meta.width} × ${meta.height}` : "…"} mono />
-            <Meta label="크기" value={meta ? fmtBytes(meta.size) : "…"} mono />
+            <Meta label="크기" value={item.size ? fmtBytes(item.size) : meta ? fmtBytes(meta.size) : "…"} mono />
             <Meta label="경로" value={item.archive ? `${item.archive} › ${item.path}` : item.path} mono dim />
           </div>
           <div style={{ padding: 12, borderTop: `1px solid ${C.borderSoft}` }}>
@@ -1239,6 +1264,7 @@ function Meta({
 
 interface StatusProps {
   count: number;
+  selectedCount: number;
   nodeName: string | null;
   sortKey: SortKey;
   selectedName: string | null;
@@ -1246,8 +1272,9 @@ interface StatusProps {
   rows: number;
 }
 
-function StatusBar({ count, nodeName, sortKey, selectedName, cols, rows }: StatusProps) {
-  const sortLabel = sortKey === "name" ? "이름" : sortKey === "format" ? "형식" : "크기";
+function StatusBar({ count, selectedCount, nodeName, sortKey, selectedName, cols, rows }: StatusProps) {
+  const sortLabel =
+    sortKey === "name" ? "이름" : sortKey === "format" ? "형식" : sortKey === "size" ? "크기" : "날짜";
   return (
     <div style={S.statusBar}>
       <Stat>{count.toLocaleString()} 이미지</Stat>
@@ -1256,7 +1283,13 @@ function StatusBar({ count, nodeName, sortKey, selectedName, cols, rows }: Statu
       <Sep />
       <Stat>정렬: {sortLabel}</Stat>
       <div style={{ flex: 1 }} />
-      {selectedName && (
+      {selectedCount > 1 && (
+        <>
+          <Stat mono>{selectedCount}개 선택</Stat>
+          <Sep />
+        </>
+      )}
+      {selectedCount <= 1 && selectedName && (
         <>
           <Stat mono>{selectedName}</Stat>
           <Sep />
@@ -1348,13 +1381,13 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
 // ---------------------------------------------------------------------------
 
 interface ConvertDialogProps {
-  selected: Item | null;
+  selected: Item[];
   all: Item[];
   onClose: () => void;
 }
 
 function ConvertDialog({ selected, all, onClose }: ConvertDialogProps) {
-  const [scope, setScope] = useState<"selected" | "all">(selected ? "selected" : "all");
+  const [scope, setScope] = useState<"selected" | "all">(selected.length ? "selected" : "all");
   const [format, setFormat] = useState<ConvertFormat>("jpg");
   const [quality, setQuality] = useState(90);
   const [overwrite, setOverwrite] = useState(false);
@@ -1363,7 +1396,7 @@ function ConvertDialog({ selected, all, onClose }: ConvertDialogProps) {
   const [report, setReport] = useState<ConvertReport | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const sources = scope === "selected" && selected ? [selected] : all;
+  const sources = scope === "selected" ? selected : all;
 
   const pickDest = async () => {
     const picked = await openDialog({ directory: true, multiple: false });
@@ -1409,12 +1442,12 @@ function ConvertDialog({ selected, all, onClose }: ConvertDialogProps) {
                 style={{
                   ...S.segBtn,
                   ...(scope === "selected" ? S.segBtnOn : null),
-                  opacity: selected ? 1 : 0.5,
+                  opacity: selected.length ? 1 : 0.5,
                 }}
-                disabled={!selected}
+                disabled={!selected.length}
                 onClick={() => setScope("selected")}
               >
-                선택 이미지 {selected ? "1" : "0"}개
+                선택 이미지 {selected.length}개
               </button>
               <button
                 style={{ ...S.segBtn, ...(scope === "all" ? S.segBtnOn : null) }}

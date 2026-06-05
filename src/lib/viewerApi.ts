@@ -18,10 +18,18 @@ export interface DirEntry {
   name: string;
   path: string;
   kind: EntryKind;
+  /** byte size from filesystem metadata (0 if unavailable) */
+  size: number;
+  /** modified time, seconds since the Unix epoch (0 if unavailable) */
+  mtime: number;
 }
 
 export interface ArchiveEntry {
   name: string;
+  /** uncompressed byte size of the entry */
+  size: number;
+  /** monotonic sort key from the entry's DOS date/time (not a true epoch) */
+  mtime: number;
 }
 
 export interface ImageMeta {
