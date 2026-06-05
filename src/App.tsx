@@ -908,6 +908,7 @@ export default function App() {
           index={viewerIndex}
           total={items.length}
           crumbs={crumbs}
+          neighbors={[items[viewerIndex - 1], items[viewerIndex + 1]].filter(Boolean)}
           onPrev={() => setViewerIndex((i) => (i === null ? i : Math.max(0, i - 1)))}
           onNext={() =>
             setViewerIndex((i) => (i === null ? i : Math.min(items.length - 1, i + 1)))
@@ -1561,6 +1562,7 @@ interface ViewerProps {
   index: number;
   total: number;
   crumbs: Crumb[];
+  neighbors: Item[];
   onPrev: () => void;
   onNext: () => void;
   onClose: () => void;
@@ -1569,12 +1571,32 @@ interface ViewerProps {
 const ZOOM_MIN = 1;
 const ZOOM_MAX = 8;
 
-function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerProps) {
+type FitMode = "fit" | "width" | "actual";
+const FIT_KEY = "glasspane.fitMode";
+const FIT_LABEL: Record<FitMode, string> = { fit: "화면", width: "너비", actual: "실제" };
+
+function fitStyle(mode: FitMode): CSSProperties {
+  switch (mode) {
+    case "width":
+      return { width: "96vw", maxWidth: "none", height: "auto", maxHeight: "none" };
+    case "actual":
+      return { width: "auto", height: "auto", maxWidth: "none", maxHeight: "none" };
+    default:
+      return { maxWidth: "86vw", maxHeight: "82vh", width: "auto", height: "auto" };
+  }
+}
+
+function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose }: ViewerProps) {
   const pathLabel = crumbs.map((c) => c.name).join(" › ");
   const backdropRef = useRef<HTMLDivElement | null>(null);
 
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [fitMode, setFitMode] = useState<FitMode>(
+    () => (localStorage.getItem(FIT_KEY) as FitMode) || "fit",
+  );
+  const [loading, setLoading] = useState(true);
+  const [errored, setErrored] = useState(false);
   const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
   const movedRef = useRef(false);
   // latest nav callbacks + a throttle so a trackpad flick doesn't skip pages
@@ -1582,11 +1604,28 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
   navRef.current = { onPrev, onNext };
   const wheelLockRef = useRef(0);
 
-  // reset zoom/pan whenever the displayed image changes
+  // reset zoom/pan/load-state whenever the displayed image changes
   useEffect(() => {
     setZoom(1);
     setOffset({ x: 0, y: 0 });
+    setLoading(true);
+    setErrored(false);
   }, [item.id]);
+
+  // remember the fit mode across pages/sessions
+  useEffect(() => {
+    localStorage.setItem(FIT_KEY, fitMode);
+  }, [fitMode]);
+
+  // preload the adjacent full images so wheel-paging is instant
+  useEffect(() => {
+    const imgs = neighbors.map((n) => {
+      const img = new Image();
+      img.src = fullUrl(n);
+      return img;
+    });
+    return () => imgs.forEach((img) => (img.src = ""));
+  }, [neighbors]);
 
   const applyZoom = useCallback((next: number) => {
     const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, next));
@@ -1631,8 +1670,10 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
     return () => window.removeEventListener("keydown", onKey);
   }, [zoom, applyZoom]);
 
+  // pannable when zoomed in, or in a fit mode that can overflow the viewport
+  const pannable = zoom > 1 || fitMode !== "fit";
   const onMouseDown = (e: ReactMouseEvent) => {
-    if (zoom <= 1) return;
+    if (!pannable) return;
     e.preventDefault();
     movedRef.current = false;
     dragRef.current = { x: e.clientX, y: e.clientY, ox: offset.x, oy: offset.y };
@@ -1658,27 +1699,46 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
       onMouseUp={endDrag}
       onMouseLeave={endDrag}
     >
-      <img
-        src={fullUrl(item)}
-        alt={item.name}
-        draggable={false}
-        onClick={(e) => e.stopPropagation()}
-        onDoubleClick={(e) => {
-          e.stopPropagation();
-          applyZoom(zoom > 1 ? 1 : 2);
-        }}
-        onMouseDown={onMouseDown}
-        style={{
-          maxWidth: "86vw",
-          maxHeight: "82vh",
-          objectFit: "contain",
-          borderRadius: 8,
-          boxShadow: "0 24px 80px rgba(0,0,0,0.6)",
-          transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
-          transition: dragRef.current ? "none" : "transform .12s ease-out",
-          cursor: zoom > 1 ? (dragRef.current ? "grabbing" : "grab") : "default",
-        }}
-      />
+      {loading && !errored && (
+        <div style={S.viewerSpinner} onClick={(e) => e.stopPropagation()}>
+          <div style={S.spinner} />
+        </div>
+      )}
+      {errored ? (
+        <div style={S.viewerBroken} onClick={(e) => e.stopPropagation()}>
+          <div style={{ fontSize: 40, opacity: 0.5 }}>🖼️</div>
+          <div style={{ fontFamily: MONO, color: C.textDim, marginTop: 8 }}>
+            이미지를 불러올 수 없습니다
+          </div>
+        </div>
+      ) : (
+        <img
+          src={fullUrl(item)}
+          alt={item.name}
+          draggable={false}
+          onLoad={() => setLoading(false)}
+          onError={() => {
+            setLoading(false);
+            setErrored(true);
+          }}
+          onClick={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => {
+            e.stopPropagation();
+            applyZoom(zoom > 1 ? 1 : 2);
+          }}
+          onMouseDown={onMouseDown}
+          style={{
+            ...fitStyle(fitMode),
+            objectFit: "contain",
+            borderRadius: 8,
+            boxShadow: "0 24px 80px rgba(0,0,0,0.6)",
+            opacity: loading ? 0 : 1,
+            transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
+            transition: dragRef.current ? "none" : "transform .12s ease-out, opacity .15s ease",
+            cursor: pannable ? (dragRef.current ? "grabbing" : "grab") : "default",
+          }}
+        />
+      )}
 
       <div style={S.viewerInfo} onClick={(e) => e.stopPropagation()}>
         <span style={{ fontFamily: MONO, color: C.textDim }}>
@@ -1689,8 +1749,23 @@ function Viewer({ item, index, total, crumbs, onPrev, onNext, onClose }: ViewerP
           {index + 1} / {total}
         </span>
         <Sep />
+        <div style={S.segment}>
+          {(["fit", "width", "actual"] as FitMode[]).map((m) => (
+            <button
+              key={m}
+              style={{ ...S.segBtn, ...(fitMode === m ? S.segBtnOn : null) }}
+              onClick={(e) => {
+                e.stopPropagation();
+                setFitMode(m);
+              }}
+              title={`맞춤: ${FIT_LABEL[m]}`}
+            >
+              {FIT_LABEL[m]}
+            </button>
+          ))}
+        </div>
         <button
-          style={{ ...S.iconBtn, fontFamily: MONO }}
+          style={{ ...S.iconBtn, fontFamily: MONO, marginLeft: 8 }}
           onClick={(e) => {
             e.stopPropagation();
             applyZoom(1);
@@ -2131,6 +2206,28 @@ const S: Record<string, CSSProperties> = {
     display: "grid",
     placeItems: "center",
     zIndex: 100,
+    overflow: "hidden",
+  },
+  viewerSpinner: {
+    position: "fixed",
+    inset: 0,
+    display: "grid",
+    placeItems: "center",
+    pointerEvents: "none",
+  },
+  spinner: {
+    width: 38,
+    height: 38,
+    borderRadius: "50%",
+    border: `3px solid ${C.border}`,
+    borderTopColor: C.accent,
+    animation: "glasspane-spin 0.8s linear infinite",
+  },
+  viewerBroken: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
   },
   navBtn: {
     position: "absolute",
