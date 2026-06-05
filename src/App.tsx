@@ -1386,6 +1386,7 @@ interface PreviewProps {
 
 function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
   const [copied, setCopied] = useState(false);
+  const [revealErr, setRevealErr] = useState(false);
   const onCopyPath = async () => {
     if (!item) return;
     if (await copyText(itemPath(item))) {
@@ -1394,7 +1395,11 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
     }
   };
   const onReveal = () => {
-    if (item) revealInExplorer(item).catch(() => {});
+    if (!item) return;
+    revealInExplorer(item).catch(() => {
+      setRevealErr(true);
+      setTimeout(() => setRevealErr(false), 1800);
+    });
   };
   return (
     <aside style={S.preview}>
@@ -1449,11 +1454,11 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
                 {copied ? "복사됨!" : "경로 복사"}
               </button>
               <button
-                style={{ ...S.ghostBtn, flex: 1 }}
+                style={{ ...S.ghostBtn, flex: 1, ...(revealErr ? { color: C.danger } : null) }}
                 onClick={onReveal}
                 title="파일 탐색기에서 보기"
               >
-                탐색기에서 보기
+                {revealErr ? "열기 실패" : "탐색기에서 보기"}
               </button>
             </div>
             <button style={{ ...S.primaryBtn, width: "100%" }} onClick={onOpenFull}>
