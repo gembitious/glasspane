@@ -1608,28 +1608,52 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
   // latest nav callbacks + a throttle so a trackpad flick doesn't skip pages
   const navRef = useRef({ onPrev, onNext });
   navRef.current = { onPrev, onNext };
+  // latest pan/mode read by the (once-attached) wheel listener
+  const stateRef = useRef({ fitMode, zoom, offsetY: offset.y });
+  stateRef.current = { fitMode, zoom, offsetY: offset.y };
   const wheelLockRef = useRef(0);
+  // which edge a freshly-entered page should land on (read on the next load)
+  const snapRef = useRef<"top" | "bottom">("top");
+
+  // In width/actual modes an overflowing page is centered at offset 0, i.e. you'd
+  // see its middle — so on entry snap it to the top (or bottom, if we paged
+  // upward) so reading starts where you expect. Fit mode just centers.
+  const applyEntrySnap = useCallback(() => {
+    const img = imgRef.current;
+    if (!img) return;
+    if (stateRef.current.fitMode === "fit") {
+      setOffset({ x: 0, y: 0 });
+      return;
+    }
+    const vh = backdropRef.current?.clientHeight ?? window.innerHeight;
+    const maxPan = Math.max(0, (img.getBoundingClientRect().height - vh) / 2);
+    setOffset({ x: 0, y: snapRef.current === "bottom" ? -maxPan : maxPan });
+    snapRef.current = "top";
+  }, []);
 
   // reset zoom/pan/load-state whenever the displayed image changes.
   // Preloaded pages are already in cache, so the <img> can be `complete`
   // before React attaches onLoad — read it directly so the spinner clears.
   useEffect(() => {
     setZoom(1);
-    setOffset({ x: 0, y: 0 });
     const img = imgRef.current;
     if (img && img.complete && img.currentSrc) {
       setErrored(img.naturalWidth === 0);
       setLoading(false);
+      applyEntrySnap();
     } else {
+      setOffset({ x: 0, y: 0 });
       setLoading(true);
       setErrored(false);
     }
-  }, [item.id]);
+  }, [item.id, applyEntrySnap]);
 
-  // remember the fit mode across pages/sessions
+  // remember the fit mode across pages/sessions; re-snap so a tall page that
+  // just became scrollable starts at the top instead of mid-image.
   useEffect(() => {
     localStorage.setItem(FIT_KEY, fitMode);
-  }, [fitMode]);
+    applyEntrySnap();
+  }, [fitMode, applyEntrySnap]);
 
   // preload the adjacent full images so wheel-paging is instant
   useEffect(() => {
@@ -1647,11 +1671,26 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
     if (z === 1) setOffset({ x: 0, y: 0 });
   }, []);
 
-  // Wheel: pages prev/next (Honeyview-style); Ctrl/⌘+wheel zooms.
+  // Wheel: Ctrl/⌘+wheel zooms. In width/actual modes the wheel first scrolls
+  // a too-tall page and only pages prev/next once it hits the top/bottom edge;
+  // in fit mode (where the page always fits) it pages straight away.
   // Native non-passive listener so we can preventDefault.
   useEffect(() => {
     const el = backdropRef.current;
     if (!el) return;
+    const page = (e: WheelEvent) => {
+      if (Math.abs(e.deltaY) < 2) return;
+      const now = Date.now();
+      if (now - wheelLockRef.current < 120) return; // throttle rapid wheel events
+      wheelLockRef.current = now;
+      if (e.deltaY > 0) {
+        snapRef.current = "top"; // next page: start reading at its top
+        navRef.current.onNext();
+      } else {
+        snapRef.current = "bottom"; // prev page: land at its bottom
+        navRef.current.onPrev();
+      }
+    };
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       if (e.ctrlKey || e.metaKey) {
@@ -1662,12 +1701,26 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
         });
         return;
       }
-      if (Math.abs(e.deltaY) < 2) return;
-      const now = Date.now();
-      if (now - wheelLockRef.current < 120) return; // throttle rapid wheel events
-      wheelLockRef.current = now;
-      if (e.deltaY > 0) navRef.current.onNext();
-      else navRef.current.onPrev();
+      // Scroll a tall page in width/actual modes; page at the vertical edges.
+      const st = stateRef.current;
+      if (st.fitMode !== "fit") {
+        const img = imgRef.current;
+        const h = img ? img.getBoundingClientRect().height : 0;
+        const maxPan = Math.max(0, (h - el.clientHeight) / 2);
+        if (maxPan > 1) {
+          const cur = st.offsetY;
+          const goingDown = e.deltaY > 0;
+          const atBottom = cur <= -maxPan + 0.5;
+          const atTop = cur >= maxPan - 0.5;
+          if ((goingDown && !atBottom) || (!goingDown && !atTop)) {
+            const step = Math.sign(e.deltaY) * Math.min(Math.abs(e.deltaY), 80);
+            const nextY = Math.max(-maxPan, Math.min(maxPan, cur - step));
+            setOffset((o) => ({ x: o.x, y: nextY }));
+            return; // consumed by scrolling; don't page yet
+          }
+        }
+      }
+      page(e);
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
@@ -1731,7 +1784,10 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
           src={fullUrl(item)}
           alt={item.name}
           draggable={false}
-          onLoad={() => setLoading(false)}
+          onLoad={() => {
+            setLoading(false);
+            applyEntrySnap();
+          }}
           onError={() => {
             setLoading(false);
             setErrored(true);
