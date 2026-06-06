@@ -88,7 +88,8 @@ npm run tauri build -- --features avif
 
 **Fullscreen viewer:** the scroll **wheel pages** prev/next (`←`/`→`/`Home`/`End` also navigate,
 `Esc` closes). Zoom with **`Ctrl`+wheel** or `+`/`-`; `0` or double-click resets; drag to pan.
-**Fit modes** — 화면 (fit) / 너비 (width) / 실제 (actual) — are in the info bar and persist.
+**Fit modes** — 화면 (fit) / 너비 (width) / 실제 (actual) — are in the info bar and persist; in
+너비/실제 the wheel **scrolls a tall page** and only turns the page at the top/bottom edge.
 Adjacent pages are preloaded so paging is instant; a spinner shows while a page loads.
 
 ## Other niceties
