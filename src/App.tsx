@@ -1599,17 +1599,26 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
   const [errored, setErrored] = useState(false);
   const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
   const movedRef = useRef(false);
+  const imgRef = useRef<HTMLImageElement | null>(null);
   // latest nav callbacks + a throttle so a trackpad flick doesn't skip pages
   const navRef = useRef({ onPrev, onNext });
   navRef.current = { onPrev, onNext };
   const wheelLockRef = useRef(0);
 
-  // reset zoom/pan/load-state whenever the displayed image changes
+  // reset zoom/pan/load-state whenever the displayed image changes.
+  // Preloaded pages are already in cache, so the <img> can be `complete`
+  // before React attaches onLoad — read it directly so the spinner clears.
   useEffect(() => {
     setZoom(1);
     setOffset({ x: 0, y: 0 });
-    setLoading(true);
-    setErrored(false);
+    const img = imgRef.current;
+    if (img && img.complete && img.currentSrc) {
+      setErrored(img.naturalWidth === 0);
+      setLoading(false);
+    } else {
+      setLoading(true);
+      setErrored(false);
+    }
   }, [item.id]);
 
   // remember the fit mode across pages/sessions
@@ -1713,6 +1722,7 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
         </div>
       ) : (
         <img
+          ref={imgRef}
           src={fullUrl(item)}
           alt={item.name}
           draggable={false}
