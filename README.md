@@ -86,9 +86,10 @@ npm run tauri build -- --features avif
 | `Ctrl/Cmd` + `A` | Select all |
 | `Enter` / `F` | Open the active image fullscreen |
 
-**Fullscreen viewer:** `←` `→` navigate, `Home` `End` jump to first/last, `Esc` closes.
-Zoom with the scroll wheel or `+` / `-`, `0` (or double-click) resets; drag to pan when
-zoomed in. The selected tile always scrolls into view as you move.
+**Fullscreen viewer:** the scroll **wheel pages** prev/next (`←`/`→`/`Home`/`End` also navigate,
+`Esc` closes). Zoom with **`Ctrl`+wheel** or `+`/`-`; `0` or double-click resets; drag to pan.
+**Fit modes** — 화면 (fit) / 너비 (width) / 실제 (actual) — are in the info bar and persist.
+Adjacent pages are preloaded so paging is instant; a spinner shows while a page loads.
 
 ## Other niceties
 

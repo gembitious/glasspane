@@ -34,3 +34,9 @@ button {
 ::-webkit-scrollbar-thumb:hover {
   background: #3a414b;
 }
+
+@keyframes glasspane-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
