@@ -450,7 +450,7 @@ fn handle_request<R: Runtime>(app: &AppHandle<R>, request: Request<Vec<u8>>) -> 
             let w: u32 = query.get("w").and_then(|s| s.parse().ok()).unwrap_or(256);
             serve_thumb(app, &src, w)
         }
-        "/full" => serve_full(&src),
+        "/full" => serve_full(app, &src),
         other => return error_response(StatusCode::NOT_FOUND, &format!("unknown route {other}")),
     };
 
@@ -487,16 +487,31 @@ fn serve_thumb<R: Runtime>(
     Ok((thumb, "image/jpeg"))
 }
 
-fn serve_full(src: &Src) -> Result<(Vec<u8>, &'static str), String> {
-    let raw = read_source_bytes(src).map_err(|e| e.to_string())?;
-    match passthrough_content_type(&ext_of(&src.path)) {
-        Some(ct) => Ok((raw, ct)),
-        // AVIF / exotic formats: transcode so any webview can render them
-        None => {
-            let _permit = decode_sem().acquire();
-            Ok((transcode_jpeg(&raw)?, "image/jpeg"))
-        }
+fn serve_full<R: Runtime>(
+    app: &AppHandle<R>,
+    src: &Src,
+) -> Result<(Vec<u8>, &'static str), String> {
+    // Webview-renderable formats stream their original bytes — no decode, so
+    // caching them would only duplicate the source on disk. Read on demand.
+    if let Some(ct) = passthrough_content_type(&ext_of(&src.path)) {
+        let raw = read_source_bytes(src).map_err(|e| e.to_string())?;
+        return Ok((raw, ct));
     }
+
+    // AVIF / exotic formats must be transcoded to JPEG. That decode is the
+    // expensive part and preloading asks for it on neighbours too, so cache the
+    // transcoded JPEG on disk (same dir + prune budget as thumbnails).
+    let dir = thumbs_dir(app)?;
+    let cache_path = dir.join(format!("{}.jpg", full_cache_key(src)));
+    if let Ok(bytes) = fs::read(&cache_path) {
+        return Ok((bytes, "image/jpeg"));
+    }
+
+    let _permit = decode_sem().acquire();
+    let raw = read_source_bytes(src).map_err(|e| e.to_string())?;
+    let jpeg = transcode_jpeg(&raw)?;
+    let _ = fs::write(&cache_path, &jpeg); // best-effort cache write
+    Ok((jpeg, "image/jpeg"))
 }
 
 fn make_thumb(bytes: &[u8], w: u32) -> Result<Vec<u8>, String> {
@@ -598,6 +613,22 @@ fn cache_key(src: &Src, w: u32) -> String {
     src.path.hash(&mut h); // inner entry name (equals path when not an archive)
     w.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+/// Cache key for a transcoded full image. Namespaced with a `"full"` marker (and
+/// a `full-` filename prefix) so it never collides with a thumbnail key, while
+/// still living in the thumbs dir so the same prune budget covers it.
+fn full_cache_key(src: &Src) -> String {
+    let container = src.archive.as_deref().unwrap_or(&src.path);
+    let (size, mtime) = file_sig(container);
+
+    let mut h = DefaultHasher::new();
+    "full".hash(&mut h);
+    container.hash(&mut h);
+    size.hash(&mut h);
+    mtime.hash(&mut h);
+    src.path.hash(&mut h);
+    format!("full-{:016x}", h.finish())
 }
 
 fn file_sig(path: &str) -> (u64, u64) {
@@ -742,6 +773,63 @@ mod tests {
         let next_day = zip::DateTime::from_date_and_time(2020, 1, 2, 0, 0, 0).unwrap();
         assert!(zip_dt_sort_key(earlier) < zip_dt_sort_key(later));
         assert!(zip_dt_sort_key(later) < zip_dt_sort_key(next_day));
+    }
+
+    /// A small solid-colour PNG in memory — a decode source for the tests below.
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            w,
+            h,
+            image::Rgb([120, 180, 240]),
+        ));
+        let mut buf = Cursor::new(Vec::new());
+        img.write_to(&mut buf, ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn make_thumb_fits_box_and_keeps_aspect() {
+        let thumb = make_thumb(&png_bytes(200, 100), 64).unwrap();
+        assert_eq!(&thumb[..2], &[0xFF, 0xD8]); // JPEG SOI marker
+        let decoded = image::load_from_memory(&thumb).unwrap();
+        // 2:1 source fits within 64×64 with the long side ≈ w
+        assert_eq!((decoded.width(), decoded.height()), (64, 32));
+    }
+
+    #[test]
+    fn transcode_jpeg_produces_decodable_jpeg() {
+        let out = transcode_jpeg(&png_bytes(40, 24)).unwrap();
+        assert_eq!(&out[..2], &[0xFF, 0xD8]);
+        let decoded = image::load_from_memory(&out).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (40, 24));
+    }
+
+    #[test]
+    fn full_cache_key_is_namespaced_and_distinct_from_thumb_key() {
+        let s = Src {
+            archive: None,
+            path: "/tmp/pic.avif".into(),
+        };
+        assert!(full_cache_key(&s).starts_with("full-"));
+        assert_ne!(full_cache_key(&s), cache_key(&s, 256));
+        assert_eq!(full_cache_key(&s), full_cache_key(&s)); // deterministic
+    }
+
+    #[test]
+    fn list_dir_sorts_dirs_first_then_case_insensitive_and_skips_others() {
+        let base = std::env::temp_dir().join(format!("glasspane-listdir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("Zebra")).unwrap();
+        fs::create_dir_all(base.join("apple")).unwrap();
+        fs::write(base.join("b.png"), b"x").unwrap();
+        fs::write(base.join("A.jpg"), b"x").unwrap();
+        fs::write(base.join("readme.txt"), b"x").unwrap(); // not image/archive → skipped
+
+        let entries = list_dir(base.to_string_lossy().into_owned()).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["apple", "Zebra", "A.jpg", "b.png"]);
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
