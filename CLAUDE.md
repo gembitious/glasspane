@@ -311,6 +311,10 @@ Each task has an acceptance criterion (AC).
 - **Thumbnail concurrency:** the protocol handler spawns a thread per request. Concurrent
   **decodes** are now capped by a global counting semaphore (≈ `available_parallelism`) around
   the decode/encode path in `imaging.rs`; cache hits skip the permit. _(Done.)_
+- **Full-image transcode cache:** `/full` streams webview-native formats as-is, but AVIF/exotic
+  sources are transcoded to JPEG. Those transcodes are now disk-cached alongside thumbnails
+  (key namespaced `full-…`, same prune budget), so re-viewing (and neighbour preloading) an AVIF
+  page doesn't re-decode it. _(Done.)_
 - **Large directories:** rely on virtualization + lazy `<img>` so only visible thumbnails
   decode; don't eagerly fetch metadata for an entire listing.
 - **Zip reads:** parsed archives are cached (small LRU keyed by `(path, size, mtime)`) so
