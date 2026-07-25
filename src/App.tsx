@@ -989,7 +989,7 @@ function Toolbar(p: ToolbarProps) {
         <button style={S.primaryBtn} onClick={p.onPickFolder} title="폴더를 선택해 트리 루트로 엽니다">
           폴더 열기
         </button>
-        <div style={{ position: "relative" }}>
+        <div style={{ position: "relative", flexShrink: 0 }}>
           <button
             style={{ ...S.ghostBtn, opacity: p.recent.length ? 1 : 0.5 }}
             disabled={!p.recent.length}
@@ -1049,18 +1049,23 @@ function Toolbar(p: ToolbarProps) {
             title="클릭하면 경로를 직접 입력할 수 있습니다"
             onDoubleClick={beginEdit}
           >
-            {p.crumbs.map((c, i) => (
-              <span key={c.path} style={{ display: "inline-flex", alignItems: "center" }}>
-                {i > 0 && <span style={{ color: C.textFaint, margin: "0 6px" }}>›</span>}
-                <button
-                  style={{ ...S.crumb, color: i === p.crumbs.length - 1 ? C.text : C.textDim }}
-                  onClick={() => p.onCrumb(c.path, c.kind)}
-                  title={c.path}
+            <div style={S.crumbsInner}>
+              {p.crumbs.map((c, i) => (
+                <span
+                  key={c.path}
+                  style={{ display: "inline-flex", alignItems: "center", flexShrink: 0 }}
                 >
-                  {c.name}
-                </button>
-              </span>
-            ))}
+                  {i > 0 && <span style={{ color: C.textFaint, margin: "0 6px" }}>›</span>}
+                  <button
+                    style={{ ...S.crumb, color: i === p.crumbs.length - 1 ? C.text : C.textDim }}
+                    onClick={() => p.onCrumb(c.path, c.kind)}
+                    title={c.path}
+                  >
+                    {c.name}
+                  </button>
+                </span>
+              ))}
+            </div>
           </div>
         )}
         <button
@@ -2068,8 +2073,34 @@ const S: Record<string, CSSProperties> = {
     background: `linear-gradient(135deg, ${C.accent}, ${C.avif})`,
   },
   toolbarWrap: { flexShrink: 0, background: C.panel, borderBottom: `1px solid ${C.border}` },
-  toolbarRow: { display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", minHeight: 44 },
-  crumbs: { display: "flex", alignItems: "center", marginLeft: 6, overflow: "hidden", cursor: "text" },
+  toolbarRow: {
+    display: "flex",
+    flexWrap: "nowrap",
+    alignItems: "center",
+    gap: 8,
+    padding: "8px 12px",
+    minHeight: 44,
+  },
+  // shrinkable, single-line breadcrumb strip: it is the only flexible item in the
+  // row (min-width:0) so a long path never pushes the buttons around or wraps
+  // them. `direction: rtl` clips the head (root) when overflowing so the current
+  // folder stays visible; crumbsInner flips back to ltr for correct reading order.
+  crumbs: {
+    display: "flex",
+    alignItems: "center",
+    marginLeft: 6,
+    overflow: "hidden",
+    cursor: "text",
+    flex: "0 1 auto",
+    minWidth: 0,
+    direction: "rtl",
+  },
+  crumbsInner: {
+    display: "inline-flex",
+    alignItems: "center",
+    direction: "ltr",
+    whiteSpace: "nowrap",
+  },
   pathInput: {
     flex: 1,
     minWidth: 120,
@@ -2090,6 +2121,7 @@ const S: Record<string, CSSProperties> = {
     fontFamily: MONO,
     fontSize: 12,
     cursor: "pointer",
+    whiteSpace: "nowrap",
   },
   toolLabel: { color: C.textFaint, fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 },
   segment: { display: "flex", border: `1px solid ${C.border}`, borderRadius: 6, overflow: "hidden" },
@@ -2118,6 +2150,8 @@ const S: Record<string, CSSProperties> = {
     padding: "7px 14px",
     borderRadius: 6,
     cursor: "pointer",
+    flexShrink: 0,
+    whiteSpace: "nowrap",
   },
   ghostBtn: {
     background: "transparent",
@@ -2126,6 +2160,8 @@ const S: Record<string, CSSProperties> = {
     borderRadius: 6,
     cursor: "pointer",
     color: C.textDim,
+    flexShrink: 0,
+    whiteSpace: "nowrap",
   },
   dropdownScrim: { position: "fixed", inset: 0, zIndex: 40 },
   dropdown: {
@@ -2172,6 +2208,7 @@ const S: Record<string, CSSProperties> = {
     borderRadius: 6,
     padding: "4px 8px",
     width: 200,
+    flexShrink: 0,
   },
   searchInput: {
     flex: 1,
@@ -2198,6 +2235,7 @@ const S: Record<string, CSSProperties> = {
     cursor: "pointer",
     fontSize: 13,
     padding: 4,
+    flexShrink: 0,
   },
   body: { display: "flex", flex: 1, minHeight: 0 },
   tree: {
