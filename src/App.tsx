@@ -79,7 +79,10 @@ interface Item {
   id: string;
   name: string;
   path: string;
+  /** set for entries inside a zip (read-only) */
   archive?: string;
+  /** folders and archives are grid entries too, like Explorer; only images open in the viewer */
+  kind: "dir" | "archive" | "image";
   fmt: string;
   size: number;
   mtime: number;
@@ -314,10 +317,16 @@ export default function App() {
 
   // explorer-style file ops: right-click menu, the dialog it opens, a toast for
   // outcomes, and a counter that forces the current node to reload afterwards
-  const [menu, setMenu] = useState<{ x: number; y: number; item: Item | null } | null>(null);
+  // `item` null = empty grid area; `fromTree` = opened on a left-panel node
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    item: Item | null;
+    fromTree?: boolean;
+  } | null>(null);
   const [dialog, setDialog] = useState<
     | { kind: "rename"; item: Item }
-    | { kind: "newFolder" }
+    | { kind: "newFolder"; parent: string }
     | { kind: "trash"; targets: Item[] }
     | null
   >(null);
@@ -475,6 +484,7 @@ export default function App() {
             name: e.name,
             path: e.name,
             archive: selected.path,
+            kind: "image" as const,
             fmt: fmtOf(e.name),
             size: e.size,
             mtime: e.mtime,
@@ -482,16 +492,17 @@ export default function App() {
         } else {
           const entries = await ensureDir(selected.path);
           if (cancelled) return;
-          items = entries
-            .filter((e) => e.kind === "image")
-            .map((e) => ({
-              id: itemIdOf(e.path),
-              name: e.name,
-              path: e.path,
-              fmt: fmtOf(e.name),
-              size: e.size,
-              mtime: e.mtime,
-            }));
+          // Explorer-style: subfolders and archives are tiles too (they sort
+          // first), so a folder of .cbz files browses like a file manager.
+          items = entries.map((e) => ({
+            id: itemIdOf(e.path),
+            name: e.name,
+            path: e.path,
+            kind: e.kind,
+            fmt: e.kind === "dir" ? "" : fmtOf(e.name),
+            size: e.size,
+            mtime: e.mtime,
+          }));
         }
         if (!cancelled) {
           loadedForRef.current = selected.path;
@@ -525,7 +536,11 @@ export default function App() {
       return known ? activeFormats.has(it.fmt as KnownFormat) : true;
     });
     const sorted = [...filtered];
+    // folders first, then archives, then images — each group by the sort key
+    const rank = (k: Item["kind"]) => (k === "dir" ? 0 : k === "archive" ? 1 : 2);
     sorted.sort((a, b) => {
+      const byKind = rank(a.kind) - rank(b.kind);
+      if (byKind) return byKind;
       switch (sortKey) {
         case "name":
           return byName(a.name, b.name);
@@ -539,6 +554,9 @@ export default function App() {
     });
     return sorted;
   }, [nodeItems, activeFormats, sortKey, query]);
+
+  // what the fullscreen viewer pages through (folders/archives are not pages)
+  const imageItems = useMemo(() => items.filter((it) => it.kind === "image"), [items]);
 
   // Restore the remembered position once this node's items are in: reselect
   // the item (if it still exists) and put the scroll back. The spacer height
@@ -585,6 +603,8 @@ export default function App() {
   // Explorer-style file ops (real files only; zip entries are read-only)
   // -------------------------------------------------------------------------
 
+  const parentOf = (p: string) => p.replace(/[\\/][^\\/]*$/, "") || p;
+
   // Drop cached listings and reload the current node. `keepId` (when given)
   // is written as the remembered position first, so the reload reselects it —
   // e.g. the renamed file under its new name.
@@ -605,12 +625,62 @@ export default function App() {
     [selected],
   );
 
-  // the right-clicked item, or the whole selection when it is part of one
+  // After entries changed on disk: invalidate their parent folders (tree and
+  // grid both read dirCache) and reload. If the node we're looking at was
+  // itself removed/moved (or sits under a folder that was), step up to its
+  // parent instead of reloading a dead path.
+  const afterChange = useCallback(
+    (changed: string[], keepId: string | null = null, extraInvalidate: string[] = []) => {
+      const stale = [...changed.map(parentOf), ...extraInvalidate];
+      const cur = selected?.path;
+      const curGone = !!cur && changed.some((p) => cur === p || cur.startsWith(p + sepOf(p)));
+      if (cur && curGone) {
+        const up = parentOf(cur);
+        setDirCache((c) => {
+          const n = { ...c };
+          for (const p of [...stale, up]) delete n[p];
+          return n;
+        });
+        if (rootPath && (up === rootPath || up.startsWith(rootPath + sepOf(rootPath)))) {
+          setSelected({ path: up, kind: "dir" });
+        } else {
+          openRoot(up); // the root itself went away — re-root one level up
+        }
+        return;
+      }
+      reloadNode(keepId, stale);
+    },
+    [selected, rootPath, openRoot, reloadNode],
+  );
+
+  // the right-clicked entry, or the whole grid selection when it is part of one
   const targetsFor = useCallback(
     (it: Item): Item[] =>
-      selectedIds.has(it.id) && selectedIds.size > 1 ? selectedItems : [it],
-    [selectedIds, selectedItems],
+      selectedIds.has(it.id) && selectedIds.size > 1 && items.some((x) => x.id === it.id)
+        ? selectedItems
+        : [it],
+    [selectedIds, selectedItems, items],
   );
+
+  // right-click on a left-panel node: same menu, built from a synthetic entry
+  const treeMenu = (e: ReactMouseEvent, path: string, kind: NodeKind, name: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      fromTree: true,
+      item: {
+        id: itemIdOf(path),
+        name,
+        path,
+        kind,
+        fmt: kind === "archive" ? fmtOf(name) : "",
+        size: 0,
+        mtime: 0,
+      },
+    });
+  };
 
   const reportFs = (verb: string, r: FsReport) => {
     if (r.failed.length) {
@@ -630,7 +700,7 @@ export default function App() {
   const fsTrash = async (targets: Item[]) => {
     const r = await trashPaths(targets.map((t) => t.path));
     reportFs("휴지통으로 이동", r);
-    reloadNode(null);
+    afterChange(targets.map((t) => t.path));
   };
 
   const fsMove = async (targets: Item[]) => {
@@ -641,33 +711,68 @@ export default function App() {
       dest,
     );
     reportFs("이동", r);
-    reloadNode(null, [dest]);
+    afterChange(
+      targets.map((t) => t.path),
+      null,
+      [dest], // the destination's listing changed too
+    );
   };
 
   // these two throw on failure so the prompt dialog can show the error inline
   const fsRename = async (it: Item, name: string) => {
     const newPath = await renamePath(it.path, name);
-    reloadNode(itemIdOf(newPath));
+    const cur = selected?.path;
+    if (cur && (cur === it.path || cur.startsWith(it.path + sepOf(it.path)))) {
+      // renamed the node we're in (or one above it): follow it to its new path
+      setDirCache((c) => {
+        const n = { ...c };
+        delete n[parentOf(it.path)];
+        delete n[it.path];
+        return n;
+      });
+      setSelected({ path: newPath, kind: it.kind === "archive" ? "archive" : "dir" });
+      return;
+    }
+    afterChange([it.path], itemIdOf(newPath));
   };
-  const fsNewFolder = async (name: string) => {
-    if (!selected) return;
-    await createDir(selected.path, name);
+  const fsNewFolder = async (parent: string, name: string) => {
+    const created = await createDir(parent, name);
     setToast({ msg: `폴더 "${name}"을(를) 만들었습니다.` });
-    reloadNode(cursorId);
+    if (selected && parent === selected.path) reloadNode(itemIdOf(created));
+    else
+      setDirCache((c) => {
+        const n = { ...c };
+        delete n[parent];
+        return n;
+      });
   };
 
-  const menuEntries = (it: Item | null): MenuEntry[] => {
+  const menuEntries = (it: Item | null, fromTree = false): MenuEntry[] => {
     const inDir = selected?.kind === "dir";
-    const newFolder: MenuEntry = {
+    const newFolderIn = (parent: string, ok: boolean): MenuEntry => ({
       label: "새 폴더…",
-      disabled: !inDir,
-      onClick: () => setDialog({ kind: "newFolder" }),
-    };
-    if (!it) return [newFolder];
-    const ro = !!it.archive; // inside a zip → read-only
+      disabled: !ok || !parent,
+      onClick: () => setDialog({ kind: "newFolder", parent }),
+    });
+    if (!it) return [newFolderIn(selected?.path ?? "", inDir)];
+    const ro = !!it.archive; // an image inside a zip → read-only
+    const container = it.kind !== "image";
     const fsTargets = targetsFor(it).filter((t) => !t.archive);
     const n = fsTargets.length;
+    // "새 폴더" goes inside a right-clicked tree folder, otherwise into the current node
+    const treeDir = fromTree && it.kind === "dir";
+    const newParent = treeDir ? it.path : (selected?.path ?? "");
     return [
+      ...(container
+        ? [
+            {
+              label: "열기",
+              hint: "Enter",
+              onClick: () =>
+                setSelected({ path: it.path, kind: it.kind === "archive" ? "archive" : "dir" }),
+            },
+          ]
+        : []),
       { label: "기본 앱으로 열기", disabled: ro, onClick: () => fsOpen(it) },
       { label: "탐색기에서 보기", onClick: () => fsReveal(it) },
       { sep: true },
@@ -678,7 +783,7 @@ export default function App() {
         onClick: () => setDialog({ kind: "rename", item: it }),
       },
       { label: n > 1 ? `${n}개 이동…` : "이동…", disabled: ro || !n, onClick: () => fsMove(fsTargets) },
-      newFolder,
+      newFolderIn(newParent, treeDir || inDir),
       { sep: true },
       {
         label: n > 1 ? `${n}개 휴지통으로 삭제` : "휴지통으로 삭제",
@@ -740,7 +845,7 @@ export default function App() {
   // preview metadata (resolution) for the active item; size/date come from the
   // listing, so sorting never needs to decode anything.
   useEffect(() => {
-    if (selectedItem) fetchMeta(selectedItem);
+    if (selectedItem?.kind === "image") fetchMeta(selectedItem);
   }, [selectedItem, fetchMeta]);
 
   // -------------------------------------------------------------------------
@@ -775,12 +880,20 @@ export default function App() {
   // Fullscreen viewer + keyboard nav
   // -------------------------------------------------------------------------
 
+  // "Open" an entry: images go to the fullscreen viewer (indexed within
+  // imageItems), folders and archives navigate into themselves.
   const openViewer = useCallback(
     (id: string) => {
-      const idx = items.findIndex((it) => it.id === id);
-      if (idx >= 0) setViewerIndex(idx);
+      const it = items.find((x) => x.id === id);
+      if (!it) return;
+      if (it.kind === "image") {
+        const idx = imageItems.findIndex((x) => x.id === id);
+        if (idx >= 0) setViewerIndex(idx);
+      } else {
+        setSelected({ path: it.path, kind: it.kind });
+      }
     },
-    [items],
+    [items, imageItems],
   );
 
   useEffect(() => {
@@ -788,15 +901,15 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setViewerIndex(null);
       else if (e.key === "ArrowRight")
-        setViewerIndex((i) => (i === null ? i : Math.min(items.length - 1, i + 1)));
+        setViewerIndex((i) => (i === null ? i : Math.min(imageItems.length - 1, i + 1)));
       else if (e.key === "ArrowLeft")
         setViewerIndex((i) => (i === null ? i : Math.max(0, i - 1)));
       else if (e.key === "Home") setViewerIndex(0);
-      else if (e.key === "End") setViewerIndex(items.length - 1);
+      else if (e.key === "End") setViewerIndex(imageItems.length - 1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [viewerIndex, items.length]);
+  }, [viewerIndex, imageItems.length]);
 
   // keep a grid index visible by nudging the scroll container
   const scrollIndexIntoView = useCallback(
@@ -817,15 +930,17 @@ export default function App() {
   // position tracks the viewer too. A multi-selection is left untouched.
   useEffect(() => {
     if (viewerIndex === null) return;
-    const it = items[viewerIndex];
+    const it = imageItems[viewerIndex];
     if (!it) return;
     setCursorId(it.id);
     setSelectedIds((prev) =>
       prev.size > 1 || (prev.size === 1 && prev.has(it.id)) ? prev : new Set([it.id]),
     );
     anchorRef.current = it.id;
-    scrollIndexIntoView(viewerIndex);
-  }, [viewerIndex, items, scrollIndexIntoView]);
+    // the viewer index is within images; the grid index counts folder/zip tiles too
+    const gridIdx = items.findIndex((x) => x.id === it.id);
+    if (gridIdx >= 0) scrollIndexIntoView(gridIdx);
+  }, [viewerIndex, items, imageItems, scrollIndexIntoView]);
 
   // grid keyboard navigation (active only when the fullscreen viewer is closed)
   useEffect(() => {
@@ -1065,6 +1180,7 @@ export default function App() {
                 selectedPath={selected?.path ?? null}
                 onToggle={toggleExpand}
                 onSelect={selectNode}
+                onMenu={treeMenu}
               />
             )}
           </div>
@@ -1159,16 +1275,16 @@ export default function App() {
         rows={rows}
       />
 
-      {viewerIndex !== null && items[viewerIndex] && (
+      {viewerIndex !== null && imageItems[viewerIndex] && (
         <Viewer
-          item={items[viewerIndex]}
+          item={imageItems[viewerIndex]}
           index={viewerIndex}
-          total={items.length}
+          total={imageItems.length}
           crumbs={crumbs}
-          neighbors={[items[viewerIndex - 1], items[viewerIndex + 1]].filter(Boolean)}
+          neighbors={[imageItems[viewerIndex - 1], imageItems[viewerIndex + 1]].filter(Boolean)}
           onPrev={() => setViewerIndex((i) => (i === null ? i : Math.max(0, i - 1)))}
           onNext={() =>
-            setViewerIndex((i) => (i === null ? i : Math.min(items.length - 1, i + 1)))
+            setViewerIndex((i) => (i === null ? i : Math.min(imageItems.length - 1, i + 1)))
           }
           onClose={() => setViewerIndex(null)}
         />
@@ -1178,7 +1294,7 @@ export default function App() {
         <ContextMenu
           x={menu.x}
           y={menu.y}
-          entries={menuEntries(menu.item)}
+          entries={menuEntries(menu.item, menu.fromTree)}
           onClose={() => setMenu(null)}
         />
       )}
@@ -1195,10 +1311,10 @@ export default function App() {
       {dialog?.kind === "newFolder" && (
         <PromptDialog
           title="새 폴더"
-          label={`"${selected ? baseName(selected.path) || selected.path : ""}" 안에 만들 폴더 이름`}
+          label={`"${baseName(dialog.parent) || dialog.parent}" 안에 만들 폴더 이름`}
           initial="새 폴더"
           submitLabel="만들기"
-          onSubmit={fsNewFolder}
+          onSubmit={(v) => fsNewFolder(dialog.parent, v)}
           onClose={() => setDialog(null)}
         />
       )}
@@ -1220,8 +1336,8 @@ export default function App() {
 
       {convertOpen && (
         <ConvertDialog
-          selected={selectedItems}
-          all={items}
+          selected={selectedItems.filter((it) => it.kind === "image")}
+          all={imageItems}
           onClose={() => setConvertOpen(false)}
         />
       )}
@@ -1483,11 +1599,13 @@ interface TreeRowProps {
   selectedPath: string | null;
   onToggle: (path: string) => void;
   onSelect: (path: string, kind: NodeKind) => void;
+  /** right-click → the explorer-style file menu for this node */
+  onMenu: (e: ReactMouseEvent, path: string, kind: NodeKind, name: string) => void;
 }
 
 function TreeRow(props: TreeRowProps) {
   const { path, name, kind, depth, dirCache, archiveCount, expanded, loadingNodes } = props;
-  const { selectedPath, onToggle, onSelect } = props;
+  const { selectedPath, onToggle, onSelect, onMenu } = props;
 
   const isDir = kind === "dir";
   const isOpen = expanded.has(path);
@@ -1512,6 +1630,7 @@ function TreeRow(props: TreeRowProps) {
         }}
         onClick={() => onSelect(path, kind)}
         onDoubleClick={() => isDir && onToggle(path)}
+        onContextMenu={(e) => onMenu(e, path, kind, name)}
         title={path}
       >
         <span
@@ -1553,6 +1672,7 @@ function TreeRow(props: TreeRowProps) {
                 selectedPath={selectedPath}
                 onToggle={onToggle}
                 onSelect={onSelect}
+                onMenu={onMenu}
               />
             ))
           )}
@@ -1609,7 +1729,12 @@ function Tile(p: TileProps) {
               : "none",
         }}
       >
-        {broken ? (
+        {item.kind !== "image" ? (
+          // folder / archive tile: an icon, no thumbnail to fetch
+          <div style={S.folderTile} title={item.kind === "dir" ? "폴더 (더블클릭으로 열기)" : "압축 파일 (더블클릭으로 열기)"}>
+            {item.kind === "dir" ? "📁" : "🗜"}
+          </div>
+        ) : broken ? (
           <div style={S.brokenTile} title="이미지를 불러올 수 없습니다">
             ⊘
           </div>
@@ -1631,10 +1756,10 @@ function Tile(p: TileProps) {
             }}
           />
         )}
-        {!loaded && !broken && (
+        {item.kind === "image" && !loaded && !broken && (
           <div style={S.skelDots}>…</div>
         )}
-        <FormatBadge fmt={item.fmt} />
+        {item.kind !== "dir" && <FormatBadge fmt={item.fmt} />}
       </div>
       <div
         style={{
@@ -1736,17 +1861,30 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
               overflow: "hidden",
             }}
           >
-            <img
-              src={thumbUrl(item, PREVIEW_W)}
-              alt={item.name}
-              style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", display: "block" }}
-            />
+            {item.kind === "image" ? (
+              <img
+                src={thumbUrl(item, PREVIEW_W)}
+                alt={item.name}
+                style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", display: "block" }}
+              />
+            ) : (
+              <div style={{ fontSize: 72, padding: 24, userSelect: "none" }}>
+                {item.kind === "dir" ? "📁" : "🗜"}
+              </div>
+            )}
           </div>
           <div style={{ padding: "0 14px", overflow: "auto", flex: 1 }}>
             <Meta label="이름" value={item.name} mono />
-            <Meta label="형식" value={item.fmt.toUpperCase()} />
-            <Meta label="해상도" value={meta ? `${meta.width} × ${meta.height}` : "…"} mono />
-            <Meta label="크기" value={item.size ? fmtBytes(item.size) : meta ? fmtBytes(meta.size) : "…"} mono />
+            <Meta
+              label="형식"
+              value={item.kind === "dir" ? "폴더" : item.kind === "archive" ? `${item.fmt.toUpperCase()} 압축` : item.fmt.toUpperCase()}
+            />
+            {item.kind === "image" && (
+              <Meta label="해상도" value={meta ? `${meta.width} × ${meta.height}` : "…"} mono />
+            )}
+            {item.kind !== "dir" && (
+              <Meta label="크기" value={item.size ? fmtBytes(item.size) : meta ? fmtBytes(meta.size) : "…"} mono />
+            )}
             <Meta label="경로" value={itemPath(item)} mono dim />
           </div>
           <div
@@ -1771,7 +1909,7 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
               </button>
             </div>
             <button style={{ ...S.primaryBtn, width: "100%" }} onClick={onOpenFull}>
-              전체화면 열기
+              {item.kind === "image" ? "전체화면 열기" : "열기"}
             </button>
           </div>
         </div>
@@ -2808,6 +2946,15 @@ const S: Record<string, CSSProperties> = {
     fontSize: 12,
   },
   menuItemDisabled: { color: C.textFaint, cursor: "default" },
+  folderTile: {
+    position: "absolute",
+    inset: 0,
+    display: "grid",
+    placeItems: "center",
+    fontSize: 44,
+    background: C.panelAlt,
+    userSelect: "none",
+  },
   menuSep: { height: 1, background: C.borderSoft, margin: "4px 6px" },
   menuHint: { fontFamily: MONO, fontSize: 10, color: C.textFaint },
   dialogInput: {
