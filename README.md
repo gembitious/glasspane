@@ -1,4 +1,4 @@
-# image-viewer
+# glasspane
 
 A fast, lightweight image viewer built around my own workflow: an explorer-style
 browser that treats `.zip`/`.cbz` archives like folders, native WebP/AVIF viewing,
@@ -9,8 +9,13 @@ Built with **Tauri 2** (Rust backend + web frontend) for a small, fast binary.
 
 ## Status
 
-Early development. The interactive UX prototype is in place; backend wiring
-(directory + archive reading, off-thread thumbnail decode) is being connected.
+Usable day to day. Everything in the target workflow is wired to the real backend:
+folder/archive tree, virtualized grid, fullscreen reader (wheel paging, fit modes,
+neighbour preloading), search, multi-select, batch convert, and an on-disk cache for
+thumbnails and transcoded full images. CI gates PRs (type-check, clippy, tests) and the
+release workflow produces deb/rpm, msi/exe, and dmg bundles.
+
+WebP and AVIF both view natively; see **Prerequisites** below for how AVIF decode is built.
 
 ## Stack
 
