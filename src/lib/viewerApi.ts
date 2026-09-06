@@ -159,3 +159,44 @@ export function convertImages(
     onProgress: channel,
   });
 }
+
+// ---------------------------------------------------------------------------
+// Explorer-style file operations (real filesystem paths only — never zip
+// entries; the UI keeps archives read-only). Nothing here overwrites a file.
+// ---------------------------------------------------------------------------
+
+export interface FsFailure {
+  path: string;
+  error: string;
+}
+
+/** Per-item outcome of a batch operation. */
+export interface FsReport {
+  ok: number;
+  failed: FsFailure[];
+}
+
+/** Move files/folders to the OS recycle bin (recoverable). */
+export function trashPaths(paths: string[]): Promise<FsReport> {
+  return invoke<FsReport>("trash_paths", { paths });
+}
+
+/** Rename in place; resolves to the new full path. Refuses to overwrite. */
+export function renamePath(path: string, newName: string): Promise<string> {
+  return invoke<string>("rename_path", { path, newName });
+}
+
+/** Move each path into `destDir` (same names). Refuses to overwrite. */
+export function movePaths(paths: string[], destDir: string): Promise<FsReport> {
+  return invoke<FsReport>("move_paths", { paths, destDir });
+}
+
+/** Create `parent/name`; resolves to the new path. Errors if it exists. */
+export function createDir(parent: string, name: string): Promise<string> {
+  return invoke<string>("create_dir", { parent, name });
+}
+
+/** Open the file with the OS default application. */
+export function openWithDefault(path: string): Promise<void> {
+  return invoke<void>("open_with_default", { path });
+}

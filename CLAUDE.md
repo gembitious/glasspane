@@ -131,6 +131,11 @@ packaging (release build verified + `.github/workflows/release.yml` via `tauri-a
   `Progress = { done, total, name }` over the channel as each file completes.
   `ConvertOpts = { format: "jpg"|"png"|"webp", destDir, quality?, overwrite? }`
   (JPEG honors `quality`; PNG/WebP are lossless). `ConvertReport = { ok, failed: [{name, error}], outputs }`.
+- **Explorer-style file ops** (in `fsops.rs`; real filesystem paths only — the UI never sends
+  zip entries, archives stay read-only; nothing overwrites an existing file):
+  `trash_paths(paths) -> FsReport` (OS recycle bin), `rename_path(path, newName) -> newPath`,
+  `move_paths(paths, destDir) -> FsReport`, `create_dir(parent, name) -> newPath`,
+  `open_with_default(path) -> ()`. `FsReport = { ok, failed: [{path, error}] }`.
 - `Src = { archive?: string, path: string }` — if `archive` is set, `path` is the **entry name
   inside that zip**; otherwise `path` is a **filesystem path**.
 

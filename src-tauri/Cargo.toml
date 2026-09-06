@@ -25,6 +25,8 @@ image = { version = "0.25" }            # WebP/JPEG/PNG/GIF decode (pure Rust); 
 zip = "2"
 tauri-plugin-dialog = "2"               # native folder picker
 tauri-plugin-window-state = "2"         # remember window size/position across launches
+trash = "5"                             # delete to the OS recycle bin (fsops.rs)
+open = "5"                              # open a file with the OS default app (fsops.rs)
 
 # AVIF decode is pure Rust: `avif-parse` reads the container (primary + alpha
 # AV1 items) and `rav1d` — the Rust port of dav1d — decodes them (see avif.rs).

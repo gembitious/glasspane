@@ -28,10 +28,16 @@ import {
   fullUrl,
   convertImages,
   revealInExplorer,
+  trashPaths,
+  renamePath,
+  movePaths,
+  createDir,
+  openWithDefault,
   type DirEntry,
   type ImageMeta,
   type ConvertFormat,
   type ConvertReport,
+  type FsReport,
 } from "./lib/viewerApi";
 import "./App.css";
 
@@ -306,6 +312,23 @@ export default function App() {
   // batch convert
   const [convertOpen, setConvertOpen] = useState(false);
 
+  // explorer-style file ops: right-click menu, the dialog it opens, a toast for
+  // outcomes, and a counter that forces the current node to reload afterwards
+  const [menu, setMenu] = useState<{ x: number; y: number; item: Item | null } | null>(null);
+  const [dialog, setDialog] = useState<
+    | { kind: "rename"; item: Item }
+    | { kind: "newFolder" }
+    | { kind: "trash"; targets: Item[] }
+    | null
+  >(null);
+  const [toast, setToast] = useState<{ msg: string; error?: boolean } | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), toast.error ? 6000 : 2500);
+    return () => clearTimeout(t);
+  }, [toast]);
+
   // metadata cache (preview + size sort); null = fetched-but-failed/unknown
   const metaRef = useRef<Record<string, ImageMeta | null>>({});
   const [metaTick, setMetaTick] = useState(0);
@@ -488,7 +511,7 @@ export default function App() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected]);
+  }, [selected, reloadTick]);
 
   // -------------------------------------------------------------------------
   // Filter + sort
@@ -557,6 +580,116 @@ export default function App() {
     () => items.filter((it) => selectedIds.has(it.id)),
     [items, selectedIds],
   );
+
+  // -------------------------------------------------------------------------
+  // Explorer-style file ops (real files only; zip entries are read-only)
+  // -------------------------------------------------------------------------
+
+  // Drop cached listings and reload the current node. `keepId` (when given)
+  // is written as the remembered position first, so the reload reselects it —
+  // e.g. the renamed file under its new name.
+  const reloadNode = useCallback(
+    (keepId: string | null | undefined, alsoInvalidate: string[] = []) => {
+      if (!selected) return;
+      if (keepId !== undefined) {
+        savePosition(selected.path, { id: keepId, top: gridRef.current?.scrollTop ?? 0 });
+      }
+      setDirCache((c) => {
+        const n = { ...c };
+        delete n[selected.path];
+        for (const p of alsoInvalidate) delete n[p];
+        return n;
+      });
+      setReloadTick((t) => t + 1);
+    },
+    [selected],
+  );
+
+  // the right-clicked item, or the whole selection when it is part of one
+  const targetsFor = useCallback(
+    (it: Item): Item[] =>
+      selectedIds.has(it.id) && selectedIds.size > 1 ? selectedItems : [it],
+    [selectedIds, selectedItems],
+  );
+
+  const reportFs = (verb: string, r: FsReport) => {
+    if (r.failed.length) {
+      const lines = r.failed.slice(0, 4).map((f) => `${baseName(f.path)}: ${f.error}`);
+      if (r.failed.length > 4) lines.push(`… 외 ${r.failed.length - 4}개`);
+      setToast({ msg: `${r.ok}개 ${verb}, ${r.failed.length}개 실패\n${lines.join("\n")}`, error: true });
+    } else {
+      setToast({ msg: `${r.ok}개 파일을 ${verb}했습니다.` });
+    }
+  };
+
+  const fsOpen = (it: Item) =>
+    openWithDefault(it.path).catch((e) => setToast({ msg: `열기 실패: ${e}`, error: true }));
+  const fsReveal = (it: Item) =>
+    revealInExplorer(it).catch((e) => setToast({ msg: `탐색기 열기 실패: ${e}`, error: true }));
+
+  const fsTrash = async (targets: Item[]) => {
+    const r = await trashPaths(targets.map((t) => t.path));
+    reportFs("휴지통으로 이동", r);
+    reloadNode(null);
+  };
+
+  const fsMove = async (targets: Item[]) => {
+    const dest = await openDialog({ directory: true, multiple: false, title: "이동할 폴더 선택" });
+    if (typeof dest !== "string") return;
+    const r = await movePaths(
+      targets.map((t) => t.path),
+      dest,
+    );
+    reportFs("이동", r);
+    reloadNode(null, [dest]);
+  };
+
+  // these two throw on failure so the prompt dialog can show the error inline
+  const fsRename = async (it: Item, name: string) => {
+    const newPath = await renamePath(it.path, name);
+    reloadNode(itemIdOf(newPath));
+  };
+  const fsNewFolder = async (name: string) => {
+    if (!selected) return;
+    await createDir(selected.path, name);
+    setToast({ msg: `폴더 "${name}"을(를) 만들었습니다.` });
+    reloadNode(cursorId);
+  };
+
+  const menuEntries = (it: Item | null): MenuEntry[] => {
+    const inDir = selected?.kind === "dir";
+    const newFolder: MenuEntry = {
+      label: "새 폴더…",
+      disabled: !inDir,
+      onClick: () => setDialog({ kind: "newFolder" }),
+    };
+    if (!it) return [newFolder];
+    const ro = !!it.archive; // inside a zip → read-only
+    const fsTargets = targetsFor(it).filter((t) => !t.archive);
+    const n = fsTargets.length;
+    return [
+      { label: "기본 앱으로 열기", disabled: ro, onClick: () => fsOpen(it) },
+      { label: "탐색기에서 보기", onClick: () => fsReveal(it) },
+      { sep: true },
+      {
+        label: "이름 변경…",
+        hint: "F2",
+        disabled: ro,
+        onClick: () => setDialog({ kind: "rename", item: it }),
+      },
+      { label: n > 1 ? `${n}개 이동…` : "이동…", disabled: ro || !n, onClick: () => fsMove(fsTargets) },
+      newFolder,
+      { sep: true },
+      {
+        label: n > 1 ? `${n}개 휴지통으로 삭제` : "휴지통으로 삭제",
+        hint: "Del",
+        danger: true,
+        disabled: ro || !n,
+        onClick: () => setDialog({ kind: "trash", targets: fsTargets }),
+      },
+      ...(ro ? [{ sep: true }, { label: "압축 파일 내부는 읽기 전용입니다", disabled: true }] : []),
+    ];
+  };
 
   // click selection with ctrl/cmd (toggle) and shift (range) modifiers
   const selectItem = useCallback(
@@ -700,6 +833,7 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       const tag = (document.activeElement?.tagName ?? "").toLowerCase();
       if (tag === "input" || tag === "textarea") return;
+      if (dialog || menu) return; // a file-ops dialog or menu owns the keyboard
 
       const cur = cursorId ? items.findIndex((it) => it.id === cursorId) : -1;
       const pageRows = Math.max(1, Math.floor(viewport.h / (cellH + GAP)));
@@ -747,6 +881,20 @@ export default function App() {
             openViewer(items[cur].id);
           }
           return;
+        case "F2":
+          if (cur >= 0 && !items[cur].archive) {
+            e.preventDefault();
+            setDialog({ kind: "rename", item: items[cur] });
+          }
+          return;
+        case "Delete": {
+          if (cur < 0) return;
+          const targets = targetsFor(items[cur]).filter((it) => !it.archive);
+          if (!targets.length) return;
+          e.preventDefault();
+          setDialog({ kind: "trash", targets });
+          return;
+        }
         default:
           return;
       }
@@ -757,7 +905,20 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [viewerIndex, items, cursorId, cols, cellH, viewport.h, openViewer, scrollIndexIntoView, selectItem]);
+  }, [
+    viewerIndex,
+    items,
+    cursorId,
+    cols,
+    cellH,
+    viewport.h,
+    openViewer,
+    scrollIndexIntoView,
+    selectItem,
+    targetsFor,
+    dialog,
+    menu,
+  ]);
 
   // -------------------------------------------------------------------------
   // Tree interactions
@@ -914,6 +1075,12 @@ export default function App() {
           ref={gridRef}
           style={S.grid}
           onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)}
+          onContextMenu={(e) => {
+            // empty grid area → folder-level menu (new folder); tiles stop propagation
+            if (!selected || selected.kind !== "dir") return;
+            e.preventDefault();
+            setMenu({ x: e.clientX, y: e.clientY, item: null });
+          }}
         >
           {gridError ? (
             <div style={{ ...S.empty, color: C.danger }}>불러오기 실패: {gridError}</div>
@@ -949,6 +1116,13 @@ export default function App() {
                       selectItem(it.id, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
                     }
                     onOpen={() => openViewer(it.id)}
+                    onMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      // like Explorer: right-clicking outside the selection selects that item
+                      if (!selectedIds.has(it.id)) selectItem(it.id, { ctrl: false, shift: false });
+                      setMenu({ x: e.clientX, y: e.clientY, item: it });
+                    }}
                     onLoaded={() => {
                       loadedRef.current.add(it.id);
                       bumpLoad();
@@ -998,6 +1172,50 @@ export default function App() {
           }
           onClose={() => setViewerIndex(null)}
         />
+      )}
+
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          entries={menuEntries(menu.item)}
+          onClose={() => setMenu(null)}
+        />
+      )}
+      {dialog?.kind === "rename" && (
+        <PromptDialog
+          title="이름 변경"
+          label="새 이름"
+          initial={dialog.item.name}
+          submitLabel="변경"
+          onSubmit={(v) => fsRename(dialog.item, v)}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dialog?.kind === "newFolder" && (
+        <PromptDialog
+          title="새 폴더"
+          label={`"${selected ? baseName(selected.path) || selected.path : ""}" 안에 만들 폴더 이름`}
+          initial="새 폴더"
+          submitLabel="만들기"
+          onSubmit={fsNewFolder}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dialog?.kind === "trash" && (
+        <ConfirmDialog
+          title="휴지통으로 이동"
+          message={`${dialog.targets.length}개 파일을 휴지통으로 이동할까요? (휴지통에서 복구할 수 있습니다)\n\n${dialog.targets
+            .slice(0, 6)
+            .map((t) => t.name)
+            .join("\n")}${dialog.targets.length > 6 ? `\n… 외 ${dialog.targets.length - 6}개` : ""}`}
+          confirmLabel="휴지통으로 이동"
+          onConfirm={() => fsTrash(dialog.targets)}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {toast && (
+        <div style={{ ...S.toast, ...(toast.error ? S.toastError : null) }}>{toast.msg}</div>
       )}
 
       {convertOpen && (
@@ -1360,6 +1578,7 @@ interface TileProps {
   cursor: boolean;
   onSelect: (e: ReactMouseEvent) => void;
   onOpen: () => void;
+  onMenu: (e: ReactMouseEvent) => void;
   onLoaded: () => void;
   onBroken: () => void;
 }
@@ -1371,6 +1590,7 @@ function Tile(p: TileProps) {
       style={{ position: "absolute", left, top, width: tile, height: tile + LABEL_H }}
       onClick={p.onSelect}
       onDoubleClick={p.onOpen}
+      onContextMenu={p.onMenu}
     >
       <div
         style={{
@@ -2047,6 +2267,214 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
 }
 
 // ---------------------------------------------------------------------------
+// Explorer-style file ops UI: context menu, prompt/confirm dialogs, toast
+// ---------------------------------------------------------------------------
+
+interface MenuEntry {
+  label?: string;
+  /** shortcut shown at the right edge */
+  hint?: string;
+  disabled?: boolean;
+  danger?: boolean;
+  onClick?: () => void;
+  /** a separator line instead of an item */
+  sep?: boolean;
+}
+
+function ContextMenu({
+  x,
+  y,
+  entries,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  entries: MenuEntry[];
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [pos, setPos] = useState({ x, y });
+  // keep the whole menu on screen
+  useEffect(() => {
+    const r = ref.current?.getBoundingClientRect();
+    if (!r) return;
+    setPos({
+      x: Math.max(4, Math.min(x, window.innerWidth - r.width - 8)),
+      y: Math.max(4, Math.min(y, window.innerHeight - r.height - 8)),
+    });
+  }, [x, y]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <>
+      <div
+        style={S.dropdownScrim}
+        onClick={onClose}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onClose();
+        }}
+      />
+      <div
+        ref={ref}
+        style={{ ...S.menu, left: pos.x, top: pos.y }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {entries.map((m, i) =>
+          m.sep ? (
+            <div key={i} style={S.menuSep} />
+          ) : (
+            <button
+              key={i}
+              style={{
+                ...S.menuItem,
+                ...(m.disabled ? S.menuItemDisabled : null),
+                ...(m.danger && !m.disabled ? { color: C.danger } : null),
+              }}
+              disabled={m.disabled}
+              onClick={() => {
+                onClose();
+                m.onClick?.();
+              }}
+            >
+              <span style={{ flex: 1 }}>{m.label}</span>
+              {m.hint && <span style={S.menuHint}>{m.hint}</span>}
+            </button>
+          ),
+        )}
+      </div>
+    </>
+  );
+}
+
+interface PromptDialogProps {
+  title: string;
+  label: string;
+  initial: string;
+  submitLabel: string;
+  /** throw / reject to show the error inline and keep the dialog open */
+  onSubmit: (value: string) => Promise<void> | void;
+  onClose: () => void;
+}
+
+function PromptDialog(p: PromptDialogProps) {
+  const [value, setValue] = useState(p.initial);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.focus();
+    // select the stem, not the extension — like Explorer's rename
+    const dot = p.initial.lastIndexOf(".");
+    el.setSelectionRange(0, dot > 0 ? dot : p.initial.length);
+  }, [p.initial]);
+  const submit = async () => {
+    const v = value.trim();
+    if (!v || v === p.initial) return p.onClose();
+    setBusy(true);
+    setError(null);
+    try {
+      await p.onSubmit(v);
+      p.onClose();
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  };
+  return (
+    <div style={S.viewerBackdrop} onClick={busy ? undefined : p.onClose}>
+      <div style={{ ...S.modal, width: 440 }} onClick={(e) => e.stopPropagation()}>
+        <div style={S.modalHeader}>
+          <span style={{ flex: 1, fontWeight: 600 }}>{p.title}</span>
+        </div>
+        <div style={{ padding: 14, display: "flex", flexDirection: "column", gap: 8 }}>
+          <label style={{ fontSize: 12, color: C.textDim }}>{p.label}</label>
+          <input
+            ref={inputRef}
+            style={S.dialogInput}
+            value={value}
+            spellCheck={false}
+            disabled={busy}
+            onChange={(e) => setValue(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") submit();
+              else if (e.key === "Escape") p.onClose();
+            }}
+          />
+          {error && <div style={{ color: C.danger, fontSize: 12 }}>{error}</div>}
+        </div>
+        <div style={S.modalFooter}>
+          <button style={S.ghostBtn} onClick={p.onClose} disabled={busy}>
+            취소
+          </button>
+          <button style={S.primaryBtn} onClick={submit} disabled={busy || !value.trim()}>
+            {p.submitLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface ConfirmDialogProps {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  onConfirm: () => Promise<void> | void;
+  onClose: () => void;
+}
+
+function ConfirmDialog(p: ConfirmDialogProps) {
+  const [busy, setBusy] = useState(false);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => btnRef.current?.focus(), []);
+  const go = async () => {
+    setBusy(true);
+    try {
+      await p.onConfirm();
+    } finally {
+      p.onClose();
+    }
+  };
+  return (
+    <div style={S.viewerBackdrop} onClick={busy ? undefined : p.onClose}>
+      <div style={{ ...S.modal, width: 440 }} onClick={(e) => e.stopPropagation()}>
+        <div style={S.modalHeader}>
+          <span style={{ flex: 1, fontWeight: 600 }}>{p.title}</span>
+        </div>
+        <div style={{ padding: 14, fontSize: 13, color: C.textDim, whiteSpace: "pre-line" }}>
+          {p.message}
+        </div>
+        <div style={S.modalFooter}>
+          <button style={S.ghostBtn} onClick={p.onClose} disabled={busy}>
+            취소
+          </button>
+          <button
+            ref={btnRef}
+            style={{ ...S.primaryBtn, background: C.danger, color: "#fff" }}
+            onClick={go}
+            disabled={busy}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") p.onClose();
+            }}
+          >
+            {p.confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Batch convert dialog
 // ---------------------------------------------------------------------------
 
@@ -2352,6 +2780,64 @@ const S: Record<string, CSSProperties> = {
     whiteSpace: "nowrap",
   },
   dropdownScrim: { position: "fixed", inset: 0, zIndex: 40 },
+  // right-click file menu
+  menu: {
+    position: "fixed",
+    minWidth: 220,
+    background: C.panelAlt,
+    border: `1px solid ${C.border}`,
+    borderRadius: 8,
+    boxShadow: "0 12px 40px rgba(0,0,0,0.5)",
+    padding: 4,
+    zIndex: 50,
+    display: "flex",
+    flexDirection: "column",
+  },
+  menuItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    width: "100%",
+    background: "transparent",
+    border: "none",
+    color: C.text,
+    padding: "7px 10px",
+    borderRadius: 6,
+    cursor: "pointer",
+    textAlign: "left",
+    fontSize: 12,
+  },
+  menuItemDisabled: { color: C.textFaint, cursor: "default" },
+  menuSep: { height: 1, background: C.borderSoft, margin: "4px 6px" },
+  menuHint: { fontFamily: MONO, fontSize: 10, color: C.textFaint },
+  dialogInput: {
+    width: "100%",
+    background: C.panel,
+    border: `1px solid ${C.accent}`,
+    borderRadius: 6,
+    outline: "none",
+    color: C.text,
+    fontFamily: MONO,
+    fontSize: 13,
+    padding: "7px 9px",
+  },
+  toast: {
+    position: "fixed",
+    left: "50%",
+    bottom: 40,
+    transform: "translateX(-50%)",
+    maxWidth: "70vw",
+    background: C.panelAlt,
+    border: `1px solid ${C.border}`,
+    borderRadius: 8,
+    boxShadow: "0 12px 40px rgba(0,0,0,0.5)",
+    padding: "9px 14px",
+    fontSize: 12,
+    color: C.text,
+    zIndex: 120,
+    whiteSpace: "pre-line",
+  },
+  toastError: { borderColor: C.danger, color: C.danger },
   dropdown: {
     position: "absolute",
     top: "calc(100% + 4px)",
