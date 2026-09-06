@@ -2,11 +2,23 @@ name: release
 
 # Build native bundles for every desktop OS and attach them to a GitHub
 # Release. Triggered by pushing a version tag (e.g. v0.1.0) or manually.
+#
+# Linux bundles are selectable per manual run (AppImage is ~78 MB and only
+# needed occasionally); tag pushes use the default (deb + rpm).
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      linux_bundles:
+        description: "Linux bundles to build (comma-separated)"
+        type: choice
+        default: "deb,rpm"
+        options:
+          - "deb,rpm"
+          - "deb,rpm,appimage"
+          - "appimage"
 
 permissions:
   contents: write
@@ -22,7 +34,9 @@ jobs:
           - platform: macos-latest # Intel
             args: "--target x86_64-apple-darwin"
           - platform: ubuntu-24.04
-            args: "--features avif" # Linux runner installs libdav1d below
+            # Linux runner installs libdav1d below. `--bundles` overrides the
+            # config targets; manual runs pick it, tag pushes fall back to deb+rpm.
+            args: "--features avif --bundles ${{ inputs.linux_bundles || 'deb,rpm' }}"
           - platform: windows-latest
             args: ""
 

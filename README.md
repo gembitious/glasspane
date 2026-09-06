@@ -103,13 +103,20 @@ Adjacent pages are preloaded so paging is instant; a spinner shows while a page 
 ## Building & releasing
 
 ```bash
-npm run tauri build              # release binary + native bundles for the host OS
-npm run tauri build -- --no-bundle   # release binary only (skips deb/AppImage/etc.)
+npm run tauri build                      # release binary + default bundles for the host OS
+npm run tauri build -- --bundles nsis    # pick bundles for this build only (overrides config)
+npm run tauri build -- --no-bundle       # release binary only (fastest)
 ```
+
+Default bundle targets (`bundle.targets` in `tauri.conf.json`): `deb`/`rpm` on Linux,
+`nsis`/`msi` on Windows, `dmg`/`app` on macOS — targets that don't apply to the host OS are
+ignored. **AppImage is off by default** (it's ~78 MB and rarely needed); build it on demand
+with `--bundles appimage`.
 
 Pushing a `v*` tag (or running the **release** workflow manually) builds bundles for
 macOS, Linux, and Windows via [`tauri-action`](.github/workflows/release.yml) and attaches
-them to a draft GitHub Release.
+them to a draft GitHub Release. A manual run lets you choose the Linux bundles
+(`deb,rpm` by default, or include `appimage`); tag pushes use the default.
 
 ## Roadmap
 
