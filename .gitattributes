@@ -1,0 +1,22 @@
+# Line-ending policy.
+#
+# Text files are stored with LF and checked out with LF on every OS, so a
+# Windows clone with core.autocrlf=true no longer reports phantom "modified"
+# files (the "LF will be replaced by CRLF" warning). Rust, TypeScript, JSON,
+# YAML, and Markdown are all happy with LF on Windows.
+* text=auto eol=lf
+
+# Windows-only scripts genuinely need CRLF (none today; kept for safety).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never touch binaries (git detects these, but be explicit — the AVIF test
+# fixtures in src-tauri/tests/fixtures must stay byte-exact).
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.webp  binary
+*.avif  binary
+*.ico   binary
+*.icns  binary
+*.gif   binary
