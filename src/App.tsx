@@ -134,6 +134,34 @@ const RECENT_KEY = "glasspane.recent";
 const RECENT_MAX = 8;
 const PREFS_KEY = "glasspane.prefs";
 
+// Last position per folder/archive: which item was selected and how far the
+// grid was scrolled, so coming back lands where you left off.
+const POS_KEY = "glasspane.positions";
+const POS_CAP = 300; // most-recent entries kept; older folders fall off
+type SavedPos = { id: string | null; top: number };
+
+function loadPositions(): Record<string, SavedPos> {
+  try {
+    const v = JSON.parse(localStorage.getItem(POS_KEY) ?? "{}");
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return {};
+  }
+}
+
+function savePosition(key: string, pos: SavedPos) {
+  try {
+    const all = loadPositions();
+    delete all[key]; // re-insert so object order doubles as recency
+    all[key] = pos;
+    const keys = Object.keys(all);
+    for (const k of keys.slice(0, Math.max(0, keys.length - POS_CAP))) delete all[k];
+    localStorage.setItem(POS_KEY, JSON.stringify(all));
+  } catch {
+    /* storage full/unavailable — remembering positions is best-effort */
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Path / format helpers
 // ---------------------------------------------------------------------------
@@ -385,6 +413,11 @@ export default function App() {
 
   const gridRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
+  // position to restore once this node's items arrive (null = nothing saved)
+  const restoreRef = useRef<SavedPos | null>(null);
+  // node whose items are currently in the grid — positions are only saved for
+  // it, so the reset-to-top during a load never overwrites a saved position
+  const loadedForRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!selected) {
@@ -404,6 +437,8 @@ export default function App() {
     brokenRef.current = new Set();
     if (gridRef.current) gridRef.current.scrollTop = 0;
     setScrollTop(0);
+    loadedForRef.current = null;
+    restoreRef.current = loadPositions()[selected.path] ?? null;
 
     (async () => {
       try {
@@ -435,7 +470,10 @@ export default function App() {
               mtime: e.mtime,
             }));
         }
-        if (!cancelled) setNodeItems(items);
+        if (!cancelled) {
+          loadedForRef.current = selected.path;
+          setNodeItems(items);
+        }
       } catch (err) {
         if (!cancelled) {
           setGridError(String(err));
@@ -478,6 +516,36 @@ export default function App() {
     });
     return sorted;
   }, [nodeItems, activeFormats, sortKey, query]);
+
+  // Restore the remembered position once this node's items are in: reselect
+  // the item (if it still exists) and put the scroll back. The spacer height
+  // depends on the freshly-rendered items, so the scroll lands on the next frame.
+  useEffect(() => {
+    const pos = restoreRef.current;
+    if (!pos || loadedForRef.current === null || gridLoading) return;
+    restoreRef.current = null;
+    if (pos.id && items.some((it) => it.id === pos.id)) {
+      setCursorId(pos.id);
+      setSelectedIds(new Set([pos.id]));
+      anchorRef.current = pos.id;
+    }
+    const raf = requestAnimationFrame(() => {
+      const el = gridRef.current;
+      if (!el) return;
+      el.scrollTop = pos.top; // the browser clamps to the real max
+      setScrollTop(el.scrollTop);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [items, gridLoading]);
+
+  // Remember the position for the node that is actually in the grid
+  // (debounced; skipped while a load or restore is still in flight).
+  useEffect(() => {
+    if (!selected || loadedForRef.current !== selected.path || restoreRef.current) return;
+    const key = selected.path;
+    const t = setTimeout(() => savePosition(key, { id: cursorId, top: scrollTop }), 250);
+    return () => clearTimeout(t);
+  }, [selected, cursorId, scrollTop]);
 
   // the "active" item drives the preview and is the base for keyboard moves
   const selectedItem = useMemo(
@@ -610,6 +678,21 @@ export default function App() {
     },
     [cols, cellH],
   );
+
+  // While the fullscreen viewer pages, keep the grid's selection on the page
+  // being viewed: closing the viewer lands where you were, and the remembered
+  // position tracks the viewer too. A multi-selection is left untouched.
+  useEffect(() => {
+    if (viewerIndex === null) return;
+    const it = items[viewerIndex];
+    if (!it) return;
+    setCursorId(it.id);
+    setSelectedIds((prev) =>
+      prev.size > 1 || (prev.size === 1 && prev.has(it.id)) ? prev : new Set([it.id]),
+    );
+    anchorRef.current = it.id;
+    scrollIndexIntoView(viewerIndex);
+  }, [viewerIndex, items, scrollIndexIntoView]);
 
   // grid keyboard navigation (active only when the fullscreen viewer is closed)
   useEffect(() => {

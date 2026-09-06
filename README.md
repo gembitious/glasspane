@@ -95,6 +95,9 @@ Adjacent pages are preloaded so paging is instant; a spinner shows while a page 
   `.zip`/`.cbz` path and jump there; `↑` goes to the parent folder (even above the current root).
 - **Drag and drop** a folder or `.zip`/`.cbz` onto the window to open it.
 - **Copy path** of the selected image from the preview panel.
+- **Last position is remembered per folder/archive** — come back and the same image is selected
+  with the grid scrolled to it. Paging in the fullscreen viewer moves that selection too, so
+  closing the viewer lands on the page you were reading.
 - The **window size and position are remembered** across launches.
 
 ## Building & releasing
