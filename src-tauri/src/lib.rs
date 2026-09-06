@@ -1,3 +1,5 @@
+#[cfg(feature = "avif")]
+mod avif;
 mod convert;
 mod imaging;
 

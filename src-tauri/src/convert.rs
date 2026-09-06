@@ -10,11 +10,11 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use image::{ExtendedColorType, ImageEncoder, ImageFormat, ImageReader};
+use image::{ExtendedColorType, ImageEncoder, ImageFormat};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 
-use crate::imaging::{read_source_bytes, Src};
+use crate::imaging::{decode_image, read_source_bytes, Src};
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -99,11 +99,8 @@ fn convert_one(
     overwrite: bool,
 ) -> Result<PathBuf, String> {
     let raw = read_source_bytes(src).map_err(|e| e.to_string())?;
-    let img = ImageReader::new(Cursor::new(&raw))
-        .with_guessed_format()
-        .map_err(|e| e.to_string())?
-        .decode()
-        .map_err(|e| e.to_string())?;
+    // shared decoder: routes AVIF to the pure-Rust path, everything else to `image`
+    let img = decode_image(&raw)?;
 
     let bytes = encode(&img, format, quality)?;
     let out_path = unique_path(dir, &base_stem(&src.path), ext, overwrite);
