@@ -1584,6 +1584,8 @@ const ZOOM_MAX = 8;
 type FitMode = "fit" | "width" | "actual";
 const FIT_KEY = "glasspane.fitMode";
 const FIT_LABEL: Record<FitMode, string> = { fit: "화면", width: "너비", actual: "실제" };
+const SLIDE_KEY = "glasspane.slideshowSec";
+const SLIDE_CHOICES = [2, 3, 5, 10];
 
 function fitStyle(mode: FitMode): CSSProperties {
   switch (mode) {
@@ -1607,6 +1609,14 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
   );
   const [loading, setLoading] = useState(true);
   const [errored, setErrored] = useState(false);
+  // per-image view transforms (reset on every page): quarter-turn rotation + mirror
+  const [rotation, setRotation] = useState(0);
+  const [flipH, setFlipH] = useState(false);
+  // slideshow: auto-advance every `slideSec` seconds; Space toggles
+  const [playing, setPlaying] = useState(false);
+  const [slideSec, setSlideSec] = useState<number>(
+    () => Number(localStorage.getItem(SLIDE_KEY)) || 3,
+  );
   const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
   const movedRef = useRef(false);
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -1641,6 +1651,8 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
   // before React attaches onLoad — read it directly so the spinner clears.
   useEffect(() => {
     setZoom(1);
+    setRotation(0);
+    setFlipH(false);
     const img = imgRef.current;
     if (img && img.complete && img.currentSrc) {
       setErrored(img.naturalWidth === 0);
@@ -1731,16 +1743,45 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
-  // +/-/0 zoom keys (arrows/Esc/Home/End are handled by the grid-level handler)
+  // Viewer keys: +/-/0 zoom, [ ] rotate, H mirror, Space slideshow
+  // (arrows/Esc/Home/End are handled by the grid-level handler)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const tag = (document.activeElement?.tagName ?? "").toLowerCase();
+      if (tag === "input" || tag === "select" || tag === "textarea") return;
       if (e.key === "+" || e.key === "=") applyZoom(zoom + 0.25);
       else if (e.key === "-" || e.key === "_") applyZoom(zoom - 0.25);
       else if (e.key === "0") applyZoom(1);
+      else if (e.key === "]") setRotation((r) => (r + 90) % 360);
+      else if (e.key === "[") setRotation((r) => (r + 270) % 360);
+      else if (e.key === "h" || e.key === "H") setFlipH((f) => !f);
+      else if (e.key === " ") {
+        e.preventDefault(); // don't scroll the page
+        setPlaying((p) => !p);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [zoom, applyZoom]);
+
+  // Slideshow: `slideSec` after each page is shown, advance; the timer restarts
+  // on every page change (manual navigation included) and stops on the last one.
+  useEffect(() => {
+    if (!playing) return;
+    if (index >= total - 1) {
+      setPlaying(false);
+      return;
+    }
+    const t = setTimeout(() => {
+      snapRef.current = "top";
+      navRef.current.onNext();
+    }, slideSec * 1000);
+    return () => clearTimeout(t);
+  }, [playing, slideSec, index, total]);
+
+  useEffect(() => {
+    localStorage.setItem(SLIDE_KEY, String(slideSec));
+  }, [slideSec]);
 
   // pannable when zoomed in, or in a fit mode that can overflow the viewport
   const pannable = zoom > 1 || fitMode !== "fit";
@@ -1809,7 +1850,7 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
             borderRadius: 8,
             boxShadow: "0 24px 80px rgba(0,0,0,0.6)",
             opacity: loading ? 0 : 1,
-            transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
+            transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom}) rotate(${rotation}deg) scaleX(${flipH ? -1 : 1})`,
             transition: dragRef.current ? "none" : "transform .12s ease-out, opacity .15s ease",
             cursor: pannable ? (dragRef.current ? "grabbing" : "grab") : "default",
           }}
@@ -1841,6 +1882,36 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
           ))}
         </div>
         <button
+          style={{ ...S.iconBtn, marginLeft: 8 }}
+          onClick={(e) => {
+            e.stopPropagation();
+            setRotation((r) => (r + 270) % 360);
+          }}
+          title="왼쪽으로 회전 ([)"
+        >
+          ↺
+        </button>
+        <button
+          style={S.iconBtn}
+          onClick={(e) => {
+            e.stopPropagation();
+            setRotation((r) => (r + 90) % 360);
+          }}
+          title="오른쪽으로 회전 (])"
+        >
+          ↻
+        </button>
+        <button
+          style={{ ...S.iconBtn, color: flipH ? C.accent : C.textDim }}
+          onClick={(e) => {
+            e.stopPropagation();
+            setFlipH((f) => !f);
+          }}
+          title="좌우 반전 (H)"
+        >
+          ⇋
+        </button>
+        <button
           style={{ ...S.iconBtn, fontFamily: MONO, marginLeft: 8 }}
           onClick={(e) => {
             e.stopPropagation();
@@ -1850,6 +1921,40 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
         >
           {Math.round(zoom * 100)}%
         </button>
+        <button
+          style={{ ...S.iconBtn, marginLeft: 8, color: playing ? C.accent : C.textDim }}
+          onClick={(e) => {
+            e.stopPropagation();
+            setPlaying((p) => !p);
+          }}
+          title={playing ? "슬라이드쇼 정지 (Space)" : "슬라이드쇼 시작 (Space)"}
+        >
+          {playing ? "⏸" : "▶"}
+        </button>
+        <select
+          value={slideSec}
+          onChange={(e) => {
+            setSlideSec(Number(e.currentTarget.value));
+            e.currentTarget.blur(); // give Space back to the slideshow toggle
+          }}
+          onClick={(e) => e.stopPropagation()}
+          title="슬라이드쇼 간격"
+          style={{
+            marginLeft: 4,
+            background: C.panelAlt,
+            color: C.textDim,
+            border: `1px solid ${C.border}`,
+            borderRadius: 4,
+            fontSize: 11,
+            padding: "2px 4px",
+          }}
+        >
+          {SLIDE_CHOICES.map((s) => (
+            <option key={s} value={s}>
+              {s}초
+            </option>
+          ))}
+        </select>
         <button style={{ ...S.iconBtn, marginLeft: 12 }} onClick={onClose} title="닫기 (Esc)">
           ✕
         </button>
