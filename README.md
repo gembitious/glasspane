@@ -15,8 +15,7 @@ neighbour preloading), search, multi-select, batch convert, and an on-disk cache
 thumbnails and transcoded full images. CI gates PRs (type-check, clippy, tests) and the
 release workflow produces deb/rpm, msi/exe, and dmg bundles.
 
-WebP works everywhere. **AVIF decode is opt-in** (`--features avif`, needs libdav1d) and
-currently only enabled on Linux/macOS builds — Windows AVIF support is the next milestone.
+WebP and AVIF both view natively; see **Prerequisites** below for how AVIF decode is built.
 
 ## Stack
 
