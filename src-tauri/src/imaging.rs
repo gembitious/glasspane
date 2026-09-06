@@ -181,23 +181,25 @@ pub fn image_meta(src: Src) -> Result<ImageMeta, String> {
             let size = fs::metadata(&src.path)
                 .map(|m| m.len())
                 .map_err(|e| e.to_string())?;
-            let (w, h) = ImageReader::open(&src.path)
-                .map_err(|e| e.to_string())?
-                .with_guessed_format()
-                .map_err(|e| e.to_string())?
-                .into_dimensions()
-                .map_err(|e| e.to_string())?;
+            let (w, h) = if ext_of(&src.path) == "avif" {
+                // AVIF dimensions sit in the container's item properties, which
+                // avif-parse reads from the whole file (they are small anyway).
+                image_dimensions(&fs::read(&src.path).map_err(|e| e.to_string())?)?
+            } else {
+                ImageReader::open(&src.path)
+                    .map_err(|e| e.to_string())?
+                    .with_guessed_format()
+                    .map_err(|e| e.to_string())?
+                    .into_dimensions()
+                    .map_err(|e| e.to_string())?
+            };
             (w, h, size)
         }
         // Zip entry: must decompress to read it, so use the bytes we get.
         Some(_) => {
             let raw = read_source_bytes(&src).map_err(|e| e.to_string())?;
             let size = raw.len() as u64;
-            let (w, h) = ImageReader::new(Cursor::new(&raw))
-                .with_guessed_format()
-                .map_err(|e| e.to_string())?
-                .into_dimensions()
-                .map_err(|e| e.to_string())?;
+            let (w, h) = image_dimensions(&raw)?;
             (w, h, size)
         }
     };
@@ -515,24 +517,60 @@ fn serve_full<R: Runtime>(
 }
 
 fn make_thumb(bytes: &[u8], w: u32) -> Result<Vec<u8>, String> {
-    let img = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| e.to_string())?
-        .decode()
-        .map_err(|e| e.to_string())?;
-
+    let img = decode_image(bytes)?;
     // `thumbnail` preserves aspect ratio, fitting within w×w (longest side ≈ w)
     let thumb = img.thumbnail(w, w);
     encode_jpeg(thumb)
 }
 
 fn transcode_jpeg(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let img = ImageReader::new(Cursor::new(bytes))
+    encode_jpeg(decode_image(bytes)?)
+}
+
+// ---------------------------------------------------------------------------
+// Decoding — every decode in the app goes through here so AVIF (which `image`
+// cannot decode without libdav1d) is routed to the pure-Rust decoder in avif.rs
+// and everything else to `image`.
+// ---------------------------------------------------------------------------
+
+/// AVIF/AVIS files are ISO-BMFF: `....ftyp` then the brand list. Cheap sniff
+/// on the first bytes so the dispatch doesn't depend on file extensions
+/// (zip entries and mislabelled files included).
+pub(crate) fn is_avif(bytes: &[u8]) -> bool {
+    bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && bytes[8..bytes.len().min(64)]
+            .windows(4)
+            .any(|w| w == b"avif" || w == b"avis")
+}
+
+pub(crate) fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    if is_avif(bytes) {
+        #[cfg(feature = "avif")]
+        return crate::avif::decode(bytes);
+        #[cfg(not(feature = "avif"))]
+        return Err("AVIF support was not compiled in (build with the `avif` feature)".into());
+    }
+    ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?
         .decode()
-        .map_err(|e| e.to_string())?;
-    encode_jpeg(img)
+        .map_err(|e| e.to_string())
+}
+
+/// `(width, height)` without a full decode where the format allows it.
+pub(crate) fn image_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
+    if is_avif(bytes) {
+        #[cfg(feature = "avif")]
+        return crate::avif::dimensions(bytes);
+        #[cfg(not(feature = "avif"))]
+        return Err("AVIF support was not compiled in (build with the `avif` feature)".into());
+    }
+    ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_dimensions()
+        .map_err(|e| e.to_string())
 }
 
 /// Encode to JPEG, dropping any alpha channel (the JPEG encoder rejects RGBA).
@@ -830,6 +868,31 @@ mod tests {
         assert_eq!(names, vec!["apple", "Zebra", "A.jpg", "b.png"]);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn is_avif_sniffs_the_ftyp_brand_not_the_extension() {
+        let avif = include_bytes!("../tests/fixtures/halves_420_8bit.avif");
+        assert!(is_avif(avif));
+        assert!(!is_avif(&png_bytes(4, 4)));
+        assert!(!is_avif(b"ftyp")); // too short to carry a brand
+    }
+
+    #[cfg(feature = "avif")]
+    #[test]
+    fn avif_goes_through_the_shared_decode_paths() {
+        let avif = include_bytes!("../tests/fixtures/halves_420_8bit.avif");
+        // dimensions without a decode
+        assert_eq!(image_dimensions(avif).unwrap(), (32, 20));
+        // full decode
+        let img = decode_image(avif).unwrap();
+        assert_eq!((img.width(), img.height()), (32, 20));
+        // and the two protocol entry points: thumbnail + JPEG transcode
+        let thumb = make_thumb(avif, 16).unwrap();
+        assert_eq!(&thumb[..2], &[0xFF, 0xD8]);
+        assert_eq!(image::load_from_memory(&thumb).unwrap().width(), 16);
+        let jpeg = transcode_jpeg(avif).unwrap();
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
     }
 
     #[test]

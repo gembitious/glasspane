@@ -21,7 +21,7 @@ WebP and AVIF both view natively; see **Prerequisites** below for how AVIF decod
 
 - Frontend: React + TypeScript + Vite
 - Backend: Rust (Tauri 2)
-- Image decode: [`image`](https://crates.io/crates/image) (WebP is pure-Rust; AVIF via the opt-in `avif` feature / libdav1d)
+- Image decode: [`image`](https://crates.io/crates/image) for WebP/JPEG/PNG/GIF; AVIF via [`avif-parse`](https://crates.io/crates/avif-parse) + [`rav1d`](https://crates.io/crates/rav1d) (the Rust port of dav1d) — all pure Rust
 - Archives: [`zip`](https://crates.io/crates/zip) (reads entries without extracting)
 
 ## Architecture
@@ -61,19 +61,11 @@ npm run tauri build    # produce a release binary
 - The rest of the [Tauri 2 prerequisites](https://tauri.app/start/prerequisites/) for your OS
   (WebView, build tools).
 
-**AVIF is opt-in.** The default build needs no extra system libraries and works everywhere
-(WebP/JPEG/PNG/GIF). AVIF decode links the system **libdav1d** (≥ 1.3.0) through pkg-config, so
-it's behind the `avif` cargo feature — enable it only where libdav1d is available:
-
-```bash
-npm run tauri dev   -- --features avif
-npm run tauri build -- --features avif
-```
-
-- Debian/Ubuntu: `sudo apt install libdav1d-dev pkg-config` (needs 24.04+; 22.04 ships 0.9.x)
-- macOS: `brew install dav1d pkg-config`
-- Windows: provide `dav1d` via vcpkg (fiddly) — or just omit `--features avif`; AVIF files then
-  show a broken-thumbnail placeholder while everything else works.
+**AVIF is built in — no extra libraries on any OS.** AVIF is decoded in pure Rust
+(`avif-parse` reads the container, `rav1d` — the Rust port of dav1d — decodes the AV1 payload),
+so the plain `npm run tauri build` supports it on Windows, macOS, and Linux alike. It sits behind
+the `avif` cargo feature, which is **on by default**; `--no-default-features` drops it if you ever
+want a slightly smaller binary.
 
 ## Keyboard shortcuts
 
@@ -127,7 +119,7 @@ them to a draft GitHub Release. A manual run lets you choose the Linux bundles
 
 - [x] Wire the UI to real directories and archives
 - [x] Background thumbnail decode + on-disk cache
-- [x] AVIF decode (enable the `avif-native` feature)
+- [x] AVIF decode — pure Rust (rav1d), on by default on every platform
 - [x] Keyboard-first navigation polish
 - [x] Filename search/filter + recent folders
 - [x] Batch export / convert module (jpg/png/webp)

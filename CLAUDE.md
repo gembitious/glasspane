@@ -48,9 +48,11 @@ It's built to fit one user's workflow — favor sharp, fast, focused behavior ov
 
 - **Frontend:** React + TypeScript + Vite
 - **Desktop shell + backend:** Tauri 2 (Rust)
-- **Image decode:** [`image`](https://crates.io/crates/image) crate — WebP is pure-Rust; AVIF
-  via the **opt-in `avif` cargo feature** (= `image/avif-native`, pulls **libdav1d**, a C lib;
-  off by default so the build works without it — notably on Windows. See §10).
+- **Image decode:** [`image`](https://crates.io/crates/image) crate for WebP/JPEG/PNG/GIF (pure
+  Rust). **AVIF is decoded in `src-tauri/src/avif.rs`** with
+  [`avif-parse`](https://crates.io/crates/avif-parse) + [`rav1d`](https://crates.io/crates/rav1d)
+  (the Rust port of dav1d) — pure Rust, no system libraries, **on by default on every platform**
+  (cargo feature `avif`; see §10).
 - **Archives:** [`zip`](https://crates.io/crates/zip) crate — reads entries without extracting.
 - **Folder picker:** `tauri-plugin-dialog`.
 - **Window state:** `tauri-plugin-window-state` remembers window size/position across launches.
@@ -163,20 +165,23 @@ packaging (release build verified + `.github/workflows/release.yml` via `tauri-a
 
 ```toml
 serde = { version = "1", features = ["derive"] }
-image = { version = "0.25" }            # WebP/JPEG/PNG/GIF (pure Rust); AVIF behind the `avif` feature
+image = { version = "0.25" }            # WebP/JPEG/PNG/GIF (pure Rust); AVIF is handled by avif.rs
 zip = "2"
 tauri-plugin-dialog = "2"               # native folder picker
+# rav1d's safe Rust API isn't in the 1.1.0 release (that only exports the C ABI), so pin the
+# upstream commit that has it; move to a crates.io version once one ships with `rust_api`.
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "d3d1cd67059f47803919be8276650e5870c9fd02", default-features = false, features = ["bitdepth_8", "bitdepth_16"], optional = true }
+avif-parse = { version = "2.1", optional = true }
 
 [features]
-default = []
-avif = ["image/avif-native"]            # opt-in AVIF decode (links system libdav1d via pkg-config)
+default = ["avif"]
+avif = ["dep:rav1d", "dep:avif-parse"]  # pure-Rust AVIF decode, on by default
 ```
 
-> AVIF is an **opt-in feature** (`--features avif`), not on by default. `image/avif-native`
-> pulls the `dav1d` crate, which links the system **libdav1d** via pkg-config (build dep:
-> `libdav1d-dev` on Debian/Ubuntu, `brew install dav1d` on macOS, vcpkg on Windows). The
-> default build needs none of that — WebP/JPEG/PNG/GIF work and AVIF sources error gracefully
-> (broken-thumbnail placeholder) — so Windows and other libdav1d-less targets build out of the box.
+> AVIF needs **no system libraries**: `avif-parse` + `rav1d` are pure Rust, so the default build
+> decodes AVIF on Windows, macOS, and Linux alike. `--no-default-features` drops it (AVIF sources
+> then error gracefully with a broken-thumbnail placeholder). `rav1d` is a git dependency pinned
+> to a commit until its Rust API is released on crates.io.
 
 ### 7.2 `src-tauri/src/lib.rs`
 
@@ -298,12 +303,13 @@ Each task has an acceptance criterion (AC).
 - **Tauri 2.x API:** confirm the `register_asynchronous_uri_scheme_protocol` closure shape
   (`|ctx, request, responder|` → `responder.respond(http::Response…)`) against the installed
   Tauri version; adjust if it differs.
-- **AVIF:** **opt-in** via the `avif` cargo feature (`--features avif` → `image/avif-native`,
-  links system **libdav1d** through pkg-config). Build dep per OS: Debian/Ubuntu `libdav1d-dev`;
-  macOS `brew install dav1d`; Windows vcpkg (fiddly). Confirmed building against libdav1d 1.4.1.
-  The **default build omits it** so libdav1d-less targets (notably Windows) build out of the box;
-  AVIF then falls back to a broken-thumbnail placeholder. CI builds with `--features avif` (the
-  Linux runner has libdav1d); release enables it on the Linux bundle only.
+- **AVIF:** decoded in pure Rust (`avif.rs`: `avif-parse` container → `rav1d` AV1 decode →
+  8-bit RGB(A) here), behind the `avif` feature which is **on by default** — no libdav1d, no
+  pkg-config, no vcpkg, so Windows builds get AVIF out of the box. `rav1d` is built with
+  `default-features = false` (no `asm`) so no NASM is needed either; still images decode fast
+  enough without it. Every decode in the app goes through `imaging::decode_image`, which sniffs
+  the `ftyp` brand and routes AVIF to `avif.rs` and everything else to `image`. Tests decode real
+  fixtures in `src-tauri/tests/fixtures` (8-bit 4:2:0, 10-bit, lossless 4:4:4, alpha).
 - **CSP:** must include the `imgsrv` scheme in `img-src` and the Google-Fonts hosts, or images
   and fonts silently fail to load.
 - **Protocol origin differs per platform** — handled in `viewerApi.ts` via a UA check; don't
