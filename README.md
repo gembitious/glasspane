@@ -88,6 +88,9 @@ want a slightly smaller binary.
 **Fit modes** — 화면 (fit) / 너비 (width) / 실제 (actual) — are in the info bar and persist; in
 너비/실제 the wheel **scrolls a tall page** and only turns the page at the top/bottom edge.
 Adjacent pages are preloaded so paging is instant; a spinner shows while a page loads.
+`[` / `]` rotate a quarter turn, `H` mirrors horizontally (both reset on the next page).
+`Space` starts/stops a **slideshow**; the interval (2–10 s) is picked in the info bar and
+remembered. It stops by itself on the last image.
 
 ## Other niceties
 
