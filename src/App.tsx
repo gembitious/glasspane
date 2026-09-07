@@ -1304,6 +1304,7 @@ export default function App() {
           label="새 이름"
           initial={dialog.item.name}
           submitLabel="변경"
+          noopIfUnchanged
           onSubmit={(v) => fsRename(dialog.item, v)}
           onClose={() => setDialog(null)}
         />
@@ -2495,6 +2496,8 @@ interface PromptDialogProps {
   label: string;
   initial: string;
   submitLabel: string;
+  /** rename-style: submitting the unchanged initial value is a no-op close */
+  noopIfUnchanged?: boolean;
   /** throw / reject to show the error inline and keep the dialog open */
   onSubmit: (value: string) => Promise<void> | void;
   onClose: () => void;
@@ -2515,7 +2518,10 @@ function PromptDialog(p: PromptDialogProps) {
   }, [p.initial]);
   const submit = async () => {
     const v = value.trim();
-    if (!v || v === p.initial) return p.onClose();
+    if (!v) return p.onClose();
+    // "새 폴더" accepted as-is must still create the folder; only a rename
+    // treats the unchanged name as "nothing to do"
+    if (p.noopIfUnchanged && v === p.initial) return p.onClose();
     setBusy(true);
     setError(null);
     try {
