@@ -28,10 +28,16 @@ import {
   fullUrl,
   convertImages,
   revealInExplorer,
+  trashPaths,
+  renamePath,
+  movePaths,
+  createDir,
+  openWithDefault,
   type DirEntry,
   type ImageMeta,
   type ConvertFormat,
   type ConvertReport,
+  type FsReport,
 } from "./lib/viewerApi";
 import "./App.css";
 
@@ -73,7 +79,10 @@ interface Item {
   id: string;
   name: string;
   path: string;
+  /** set for entries inside a zip (read-only) */
   archive?: string;
+  /** folders and archives are grid entries too, like Explorer; only images open in the viewer */
+  kind: "dir" | "archive" | "image";
   fmt: string;
   size: number;
   mtime: number;
@@ -306,6 +315,29 @@ export default function App() {
   // batch convert
   const [convertOpen, setConvertOpen] = useState(false);
 
+  // explorer-style file ops: right-click menu, the dialog it opens, a toast for
+  // outcomes, and a counter that forces the current node to reload afterwards
+  // `item` null = empty grid area; `fromTree` = opened on a left-panel node
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    item: Item | null;
+    fromTree?: boolean;
+  } | null>(null);
+  const [dialog, setDialog] = useState<
+    | { kind: "rename"; item: Item }
+    | { kind: "newFolder"; parent: string }
+    | { kind: "trash"; targets: Item[] }
+    | null
+  >(null);
+  const [toast, setToast] = useState<{ msg: string; error?: boolean } | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), toast.error ? 6000 : 2500);
+    return () => clearTimeout(t);
+  }, [toast]);
+
   // metadata cache (preview + size sort); null = fetched-but-failed/unknown
   const metaRef = useRef<Record<string, ImageMeta | null>>({});
   const [metaTick, setMetaTick] = useState(0);
@@ -452,6 +484,7 @@ export default function App() {
             name: e.name,
             path: e.name,
             archive: selected.path,
+            kind: "image" as const,
             fmt: fmtOf(e.name),
             size: e.size,
             mtime: e.mtime,
@@ -459,16 +492,17 @@ export default function App() {
         } else {
           const entries = await ensureDir(selected.path);
           if (cancelled) return;
-          items = entries
-            .filter((e) => e.kind === "image")
-            .map((e) => ({
-              id: itemIdOf(e.path),
-              name: e.name,
-              path: e.path,
-              fmt: fmtOf(e.name),
-              size: e.size,
-              mtime: e.mtime,
-            }));
+          // Explorer-style: subfolders and archives are tiles too (they sort
+          // first), so a folder of .cbz files browses like a file manager.
+          items = entries.map((e) => ({
+            id: itemIdOf(e.path),
+            name: e.name,
+            path: e.path,
+            kind: e.kind,
+            fmt: e.kind === "dir" ? "" : fmtOf(e.name),
+            size: e.size,
+            mtime: e.mtime,
+          }));
         }
         if (!cancelled) {
           loadedForRef.current = selected.path;
@@ -488,7 +522,7 @@ export default function App() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected]);
+  }, [selected, reloadTick]);
 
   // -------------------------------------------------------------------------
   // Filter + sort
@@ -502,7 +536,11 @@ export default function App() {
       return known ? activeFormats.has(it.fmt as KnownFormat) : true;
     });
     const sorted = [...filtered];
+    // folders first, then archives, then images — each group by the sort key
+    const rank = (k: Item["kind"]) => (k === "dir" ? 0 : k === "archive" ? 1 : 2);
     sorted.sort((a, b) => {
+      const byKind = rank(a.kind) - rank(b.kind);
+      if (byKind) return byKind;
       switch (sortKey) {
         case "name":
           return byName(a.name, b.name);
@@ -516,6 +554,9 @@ export default function App() {
     });
     return sorted;
   }, [nodeItems, activeFormats, sortKey, query]);
+
+  // what the fullscreen viewer pages through (folders/archives are not pages)
+  const imageItems = useMemo(() => items.filter((it) => it.kind === "image"), [items]);
 
   // Restore the remembered position once this node's items are in: reselect
   // the item (if it still exists) and put the scroll back. The spacer height
@@ -557,6 +598,203 @@ export default function App() {
     () => items.filter((it) => selectedIds.has(it.id)),
     [items, selectedIds],
   );
+
+  // -------------------------------------------------------------------------
+  // Explorer-style file ops (real files only; zip entries are read-only)
+  // -------------------------------------------------------------------------
+
+  const parentOf = (p: string) => p.replace(/[\\/][^\\/]*$/, "") || p;
+
+  // Drop cached listings and reload the current node. `keepId` (when given)
+  // is written as the remembered position first, so the reload reselects it —
+  // e.g. the renamed file under its new name.
+  const reloadNode = useCallback(
+    (keepId: string | null | undefined, alsoInvalidate: string[] = []) => {
+      if (!selected) return;
+      if (keepId !== undefined) {
+        savePosition(selected.path, { id: keepId, top: gridRef.current?.scrollTop ?? 0 });
+      }
+      setDirCache((c) => {
+        const n = { ...c };
+        delete n[selected.path];
+        for (const p of alsoInvalidate) delete n[p];
+        return n;
+      });
+      setReloadTick((t) => t + 1);
+    },
+    [selected],
+  );
+
+  // After entries changed on disk: invalidate their parent folders (tree and
+  // grid both read dirCache) and reload. If the node we're looking at was
+  // itself removed/moved (or sits under a folder that was), step up to its
+  // parent instead of reloading a dead path.
+  const afterChange = useCallback(
+    (changed: string[], keepId: string | null = null, extraInvalidate: string[] = []) => {
+      const stale = [...changed.map(parentOf), ...extraInvalidate];
+      const cur = selected?.path;
+      const curGone = !!cur && changed.some((p) => cur === p || cur.startsWith(p + sepOf(p)));
+      if (cur && curGone) {
+        const up = parentOf(cur);
+        setDirCache((c) => {
+          const n = { ...c };
+          for (const p of [...stale, up]) delete n[p];
+          return n;
+        });
+        if (rootPath && (up === rootPath || up.startsWith(rootPath + sepOf(rootPath)))) {
+          setSelected({ path: up, kind: "dir" });
+        } else {
+          openRoot(up); // the root itself went away — re-root one level up
+        }
+        return;
+      }
+      reloadNode(keepId, stale);
+    },
+    [selected, rootPath, openRoot, reloadNode],
+  );
+
+  // the right-clicked entry, or the whole grid selection when it is part of one
+  const targetsFor = useCallback(
+    (it: Item): Item[] =>
+      selectedIds.has(it.id) && selectedIds.size > 1 && items.some((x) => x.id === it.id)
+        ? selectedItems
+        : [it],
+    [selectedIds, selectedItems, items],
+  );
+
+  // right-click on a left-panel node: same menu, built from a synthetic entry
+  const treeMenu = (e: ReactMouseEvent, path: string, kind: NodeKind, name: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      fromTree: true,
+      item: {
+        id: itemIdOf(path),
+        name,
+        path,
+        kind,
+        fmt: kind === "archive" ? fmtOf(name) : "",
+        size: 0,
+        mtime: 0,
+      },
+    });
+  };
+
+  const reportFs = (verb: string, r: FsReport) => {
+    if (r.failed.length) {
+      const lines = r.failed.slice(0, 4).map((f) => `${baseName(f.path)}: ${f.error}`);
+      if (r.failed.length > 4) lines.push(`… 외 ${r.failed.length - 4}개`);
+      setToast({ msg: `${r.ok}개 ${verb}, ${r.failed.length}개 실패\n${lines.join("\n")}`, error: true });
+    } else {
+      setToast({ msg: `${r.ok}개 파일을 ${verb}했습니다.` });
+    }
+  };
+
+  const fsOpen = (it: Item) =>
+    openWithDefault(it.path).catch((e) => setToast({ msg: `열기 실패: ${e}`, error: true }));
+  const fsReveal = (it: Item) =>
+    revealInExplorer(it).catch((e) => setToast({ msg: `탐색기 열기 실패: ${e}`, error: true }));
+
+  const fsTrash = async (targets: Item[]) => {
+    const r = await trashPaths(targets.map((t) => t.path));
+    reportFs("휴지통으로 이동", r);
+    afterChange(targets.map((t) => t.path));
+  };
+
+  const fsMove = async (targets: Item[]) => {
+    const dest = await openDialog({ directory: true, multiple: false, title: "이동할 폴더 선택" });
+    if (typeof dest !== "string") return;
+    const r = await movePaths(
+      targets.map((t) => t.path),
+      dest,
+    );
+    reportFs("이동", r);
+    afterChange(
+      targets.map((t) => t.path),
+      null,
+      [dest], // the destination's listing changed too
+    );
+  };
+
+  // these two throw on failure so the prompt dialog can show the error inline
+  const fsRename = async (it: Item, name: string) => {
+    const newPath = await renamePath(it.path, name);
+    const cur = selected?.path;
+    if (cur && (cur === it.path || cur.startsWith(it.path + sepOf(it.path)))) {
+      // renamed the node we're in (or one above it): follow it to its new path
+      setDirCache((c) => {
+        const n = { ...c };
+        delete n[parentOf(it.path)];
+        delete n[it.path];
+        return n;
+      });
+      setSelected({ path: newPath, kind: it.kind === "archive" ? "archive" : "dir" });
+      return;
+    }
+    afterChange([it.path], itemIdOf(newPath));
+  };
+  const fsNewFolder = async (parent: string, name: string) => {
+    const created = await createDir(parent, name);
+    setToast({ msg: `폴더 "${name}"을(를) 만들었습니다.` });
+    if (selected && parent === selected.path) reloadNode(itemIdOf(created));
+    else
+      setDirCache((c) => {
+        const n = { ...c };
+        delete n[parent];
+        return n;
+      });
+  };
+
+  const menuEntries = (it: Item | null, fromTree = false): MenuEntry[] => {
+    const inDir = selected?.kind === "dir";
+    const newFolderIn = (parent: string, ok: boolean): MenuEntry => ({
+      label: "새 폴더…",
+      disabled: !ok || !parent,
+      onClick: () => setDialog({ kind: "newFolder", parent }),
+    });
+    if (!it) return [newFolderIn(selected?.path ?? "", inDir)];
+    const ro = !!it.archive; // an image inside a zip → read-only
+    const container = it.kind !== "image";
+    const fsTargets = targetsFor(it).filter((t) => !t.archive);
+    const n = fsTargets.length;
+    // "새 폴더" goes inside a right-clicked tree folder, otherwise into the current node
+    const treeDir = fromTree && it.kind === "dir";
+    const newParent = treeDir ? it.path : (selected?.path ?? "");
+    return [
+      ...(container
+        ? [
+            {
+              label: "열기",
+              hint: "Enter",
+              onClick: () =>
+                setSelected({ path: it.path, kind: it.kind === "archive" ? "archive" : "dir" }),
+            },
+          ]
+        : []),
+      { label: "기본 앱으로 열기", disabled: ro, onClick: () => fsOpen(it) },
+      { label: "탐색기에서 보기", onClick: () => fsReveal(it) },
+      { sep: true },
+      {
+        label: "이름 변경…",
+        hint: "F2",
+        disabled: ro,
+        onClick: () => setDialog({ kind: "rename", item: it }),
+      },
+      { label: n > 1 ? `${n}개 이동…` : "이동…", disabled: ro || !n, onClick: () => fsMove(fsTargets) },
+      newFolderIn(newParent, treeDir || inDir),
+      { sep: true },
+      {
+        label: n > 1 ? `${n}개 휴지통으로 삭제` : "휴지통으로 삭제",
+        hint: "Del",
+        danger: true,
+        disabled: ro || !n,
+        onClick: () => setDialog({ kind: "trash", targets: fsTargets }),
+      },
+      ...(ro ? [{ sep: true }, { label: "압축 파일 내부는 읽기 전용입니다", disabled: true }] : []),
+    ];
+  };
 
   // click selection with ctrl/cmd (toggle) and shift (range) modifiers
   const selectItem = useCallback(
@@ -607,7 +845,7 @@ export default function App() {
   // preview metadata (resolution) for the active item; size/date come from the
   // listing, so sorting never needs to decode anything.
   useEffect(() => {
-    if (selectedItem) fetchMeta(selectedItem);
+    if (selectedItem?.kind === "image") fetchMeta(selectedItem);
   }, [selectedItem, fetchMeta]);
 
   // -------------------------------------------------------------------------
@@ -642,12 +880,20 @@ export default function App() {
   // Fullscreen viewer + keyboard nav
   // -------------------------------------------------------------------------
 
+  // "Open" an entry: images go to the fullscreen viewer (indexed within
+  // imageItems), folders and archives navigate into themselves.
   const openViewer = useCallback(
     (id: string) => {
-      const idx = items.findIndex((it) => it.id === id);
-      if (idx >= 0) setViewerIndex(idx);
+      const it = items.find((x) => x.id === id);
+      if (!it) return;
+      if (it.kind === "image") {
+        const idx = imageItems.findIndex((x) => x.id === id);
+        if (idx >= 0) setViewerIndex(idx);
+      } else {
+        setSelected({ path: it.path, kind: it.kind });
+      }
     },
-    [items],
+    [items, imageItems],
   );
 
   useEffect(() => {
@@ -655,15 +901,15 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setViewerIndex(null);
       else if (e.key === "ArrowRight")
-        setViewerIndex((i) => (i === null ? i : Math.min(items.length - 1, i + 1)));
+        setViewerIndex((i) => (i === null ? i : Math.min(imageItems.length - 1, i + 1)));
       else if (e.key === "ArrowLeft")
         setViewerIndex((i) => (i === null ? i : Math.max(0, i - 1)));
       else if (e.key === "Home") setViewerIndex(0);
-      else if (e.key === "End") setViewerIndex(items.length - 1);
+      else if (e.key === "End") setViewerIndex(imageItems.length - 1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [viewerIndex, items.length]);
+  }, [viewerIndex, imageItems.length]);
 
   // keep a grid index visible by nudging the scroll container
   const scrollIndexIntoView = useCallback(
@@ -684,15 +930,17 @@ export default function App() {
   // position tracks the viewer too. A multi-selection is left untouched.
   useEffect(() => {
     if (viewerIndex === null) return;
-    const it = items[viewerIndex];
+    const it = imageItems[viewerIndex];
     if (!it) return;
     setCursorId(it.id);
     setSelectedIds((prev) =>
       prev.size > 1 || (prev.size === 1 && prev.has(it.id)) ? prev : new Set([it.id]),
     );
     anchorRef.current = it.id;
-    scrollIndexIntoView(viewerIndex);
-  }, [viewerIndex, items, scrollIndexIntoView]);
+    // the viewer index is within images; the grid index counts folder/zip tiles too
+    const gridIdx = items.findIndex((x) => x.id === it.id);
+    if (gridIdx >= 0) scrollIndexIntoView(gridIdx);
+  }, [viewerIndex, items, imageItems, scrollIndexIntoView]);
 
   // grid keyboard navigation (active only when the fullscreen viewer is closed)
   useEffect(() => {
@@ -700,6 +948,7 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       const tag = (document.activeElement?.tagName ?? "").toLowerCase();
       if (tag === "input" || tag === "textarea") return;
+      if (dialog || menu) return; // a file-ops dialog or menu owns the keyboard
 
       const cur = cursorId ? items.findIndex((it) => it.id === cursorId) : -1;
       const pageRows = Math.max(1, Math.floor(viewport.h / (cellH + GAP)));
@@ -747,6 +996,20 @@ export default function App() {
             openViewer(items[cur].id);
           }
           return;
+        case "F2":
+          if (cur >= 0 && !items[cur].archive) {
+            e.preventDefault();
+            setDialog({ kind: "rename", item: items[cur] });
+          }
+          return;
+        case "Delete": {
+          if (cur < 0) return;
+          const targets = targetsFor(items[cur]).filter((it) => !it.archive);
+          if (!targets.length) return;
+          e.preventDefault();
+          setDialog({ kind: "trash", targets });
+          return;
+        }
         default:
           return;
       }
@@ -757,7 +1020,20 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [viewerIndex, items, cursorId, cols, cellH, viewport.h, openViewer, scrollIndexIntoView, selectItem]);
+  }, [
+    viewerIndex,
+    items,
+    cursorId,
+    cols,
+    cellH,
+    viewport.h,
+    openViewer,
+    scrollIndexIntoView,
+    selectItem,
+    targetsFor,
+    dialog,
+    menu,
+  ]);
 
   // -------------------------------------------------------------------------
   // Tree interactions
@@ -904,6 +1180,7 @@ export default function App() {
                 selectedPath={selected?.path ?? null}
                 onToggle={toggleExpand}
                 onSelect={selectNode}
+                onMenu={treeMenu}
               />
             )}
           </div>
@@ -914,6 +1191,12 @@ export default function App() {
           ref={gridRef}
           style={S.grid}
           onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)}
+          onContextMenu={(e) => {
+            // empty grid area → folder-level menu (new folder); tiles stop propagation
+            if (!selected || selected.kind !== "dir") return;
+            e.preventDefault();
+            setMenu({ x: e.clientX, y: e.clientY, item: null });
+          }}
         >
           {gridError ? (
             <div style={{ ...S.empty, color: C.danger }}>불러오기 실패: {gridError}</div>
@@ -949,6 +1232,13 @@ export default function App() {
                       selectItem(it.id, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
                     }
                     onOpen={() => openViewer(it.id)}
+                    onMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      // like Explorer: right-clicking outside the selection selects that item
+                      if (!selectedIds.has(it.id)) selectItem(it.id, { ctrl: false, shift: false });
+                      setMenu({ x: e.clientX, y: e.clientY, item: it });
+                    }}
                     onLoaded={() => {
                       loadedRef.current.add(it.id);
                       bumpLoad();
@@ -985,25 +1275,69 @@ export default function App() {
         rows={rows}
       />
 
-      {viewerIndex !== null && items[viewerIndex] && (
+      {viewerIndex !== null && imageItems[viewerIndex] && (
         <Viewer
-          item={items[viewerIndex]}
+          item={imageItems[viewerIndex]}
           index={viewerIndex}
-          total={items.length}
+          total={imageItems.length}
           crumbs={crumbs}
-          neighbors={[items[viewerIndex - 1], items[viewerIndex + 1]].filter(Boolean)}
+          neighbors={[imageItems[viewerIndex - 1], imageItems[viewerIndex + 1]].filter(Boolean)}
           onPrev={() => setViewerIndex((i) => (i === null ? i : Math.max(0, i - 1)))}
           onNext={() =>
-            setViewerIndex((i) => (i === null ? i : Math.min(items.length - 1, i + 1)))
+            setViewerIndex((i) => (i === null ? i : Math.min(imageItems.length - 1, i + 1)))
           }
           onClose={() => setViewerIndex(null)}
         />
       )}
 
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          entries={menuEntries(menu.item, menu.fromTree)}
+          onClose={() => setMenu(null)}
+        />
+      )}
+      {dialog?.kind === "rename" && (
+        <PromptDialog
+          title="이름 변경"
+          label="새 이름"
+          initial={dialog.item.name}
+          submitLabel="변경"
+          onSubmit={(v) => fsRename(dialog.item, v)}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dialog?.kind === "newFolder" && (
+        <PromptDialog
+          title="새 폴더"
+          label={`"${baseName(dialog.parent) || dialog.parent}" 안에 만들 폴더 이름`}
+          initial="새 폴더"
+          submitLabel="만들기"
+          onSubmit={(v) => fsNewFolder(dialog.parent, v)}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dialog?.kind === "trash" && (
+        <ConfirmDialog
+          title="휴지통으로 이동"
+          message={`${dialog.targets.length}개 파일을 휴지통으로 이동할까요? (휴지통에서 복구할 수 있습니다)\n\n${dialog.targets
+            .slice(0, 6)
+            .map((t) => t.name)
+            .join("\n")}${dialog.targets.length > 6 ? `\n… 외 ${dialog.targets.length - 6}개` : ""}`}
+          confirmLabel="휴지통으로 이동"
+          onConfirm={() => fsTrash(dialog.targets)}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {toast && (
+        <div style={{ ...S.toast, ...(toast.error ? S.toastError : null) }}>{toast.msg}</div>
+      )}
+
       {convertOpen && (
         <ConvertDialog
-          selected={selectedItems}
-          all={items}
+          selected={selectedItems.filter((it) => it.kind === "image")}
+          all={imageItems}
           onClose={() => setConvertOpen(false)}
         />
       )}
@@ -1265,11 +1599,13 @@ interface TreeRowProps {
   selectedPath: string | null;
   onToggle: (path: string) => void;
   onSelect: (path: string, kind: NodeKind) => void;
+  /** right-click → the explorer-style file menu for this node */
+  onMenu: (e: ReactMouseEvent, path: string, kind: NodeKind, name: string) => void;
 }
 
 function TreeRow(props: TreeRowProps) {
   const { path, name, kind, depth, dirCache, archiveCount, expanded, loadingNodes } = props;
-  const { selectedPath, onToggle, onSelect } = props;
+  const { selectedPath, onToggle, onSelect, onMenu } = props;
 
   const isDir = kind === "dir";
   const isOpen = expanded.has(path);
@@ -1294,6 +1630,7 @@ function TreeRow(props: TreeRowProps) {
         }}
         onClick={() => onSelect(path, kind)}
         onDoubleClick={() => isDir && onToggle(path)}
+        onContextMenu={(e) => onMenu(e, path, kind, name)}
         title={path}
       >
         <span
@@ -1335,6 +1672,7 @@ function TreeRow(props: TreeRowProps) {
                 selectedPath={selectedPath}
                 onToggle={onToggle}
                 onSelect={onSelect}
+                onMenu={onMenu}
               />
             ))
           )}
@@ -1360,6 +1698,7 @@ interface TileProps {
   cursor: boolean;
   onSelect: (e: ReactMouseEvent) => void;
   onOpen: () => void;
+  onMenu: (e: ReactMouseEvent) => void;
   onLoaded: () => void;
   onBroken: () => void;
 }
@@ -1371,6 +1710,7 @@ function Tile(p: TileProps) {
       style={{ position: "absolute", left, top, width: tile, height: tile + LABEL_H }}
       onClick={p.onSelect}
       onDoubleClick={p.onOpen}
+      onContextMenu={p.onMenu}
     >
       <div
         style={{
@@ -1389,7 +1729,12 @@ function Tile(p: TileProps) {
               : "none",
         }}
       >
-        {broken ? (
+        {item.kind !== "image" ? (
+          // folder / archive tile: an icon, no thumbnail to fetch
+          <div style={S.folderTile} title={item.kind === "dir" ? "폴더 (더블클릭으로 열기)" : "압축 파일 (더블클릭으로 열기)"}>
+            {item.kind === "dir" ? "📁" : "🗜"}
+          </div>
+        ) : broken ? (
           <div style={S.brokenTile} title="이미지를 불러올 수 없습니다">
             ⊘
           </div>
@@ -1411,10 +1756,10 @@ function Tile(p: TileProps) {
             }}
           />
         )}
-        {!loaded && !broken && (
+        {item.kind === "image" && !loaded && !broken && (
           <div style={S.skelDots}>…</div>
         )}
-        <FormatBadge fmt={item.fmt} />
+        {item.kind !== "dir" && <FormatBadge fmt={item.fmt} />}
       </div>
       <div
         style={{
@@ -1516,17 +1861,30 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
               overflow: "hidden",
             }}
           >
-            <img
-              src={thumbUrl(item, PREVIEW_W)}
-              alt={item.name}
-              style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", display: "block" }}
-            />
+            {item.kind === "image" ? (
+              <img
+                src={thumbUrl(item, PREVIEW_W)}
+                alt={item.name}
+                style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", display: "block" }}
+              />
+            ) : (
+              <div style={{ fontSize: 72, padding: 24, userSelect: "none" }}>
+                {item.kind === "dir" ? "📁" : "🗜"}
+              </div>
+            )}
           </div>
           <div style={{ padding: "0 14px", overflow: "auto", flex: 1 }}>
             <Meta label="이름" value={item.name} mono />
-            <Meta label="형식" value={item.fmt.toUpperCase()} />
-            <Meta label="해상도" value={meta ? `${meta.width} × ${meta.height}` : "…"} mono />
-            <Meta label="크기" value={item.size ? fmtBytes(item.size) : meta ? fmtBytes(meta.size) : "…"} mono />
+            <Meta
+              label="형식"
+              value={item.kind === "dir" ? "폴더" : item.kind === "archive" ? `${item.fmt.toUpperCase()} 압축` : item.fmt.toUpperCase()}
+            />
+            {item.kind === "image" && (
+              <Meta label="해상도" value={meta ? `${meta.width} × ${meta.height}` : "…"} mono />
+            )}
+            {item.kind !== "dir" && (
+              <Meta label="크기" value={item.size ? fmtBytes(item.size) : meta ? fmtBytes(meta.size) : "…"} mono />
+            )}
             <Meta label="경로" value={itemPath(item)} mono dim />
           </div>
           <div
@@ -1551,7 +1909,7 @@ function PreviewPanel({ item, meta, onOpenFull, onClose }: PreviewProps) {
               </button>
             </div>
             <button style={{ ...S.primaryBtn, width: "100%" }} onClick={onOpenFull}>
-              전체화면 열기
+              {item.kind === "image" ? "전체화면 열기" : "열기"}
             </button>
           </div>
         </div>
@@ -2047,6 +2405,214 @@ function Viewer({ item, index, total, crumbs, neighbors, onPrev, onNext, onClose
 }
 
 // ---------------------------------------------------------------------------
+// Explorer-style file ops UI: context menu, prompt/confirm dialogs, toast
+// ---------------------------------------------------------------------------
+
+interface MenuEntry {
+  label?: string;
+  /** shortcut shown at the right edge */
+  hint?: string;
+  disabled?: boolean;
+  danger?: boolean;
+  onClick?: () => void;
+  /** a separator line instead of an item */
+  sep?: boolean;
+}
+
+function ContextMenu({
+  x,
+  y,
+  entries,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  entries: MenuEntry[];
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [pos, setPos] = useState({ x, y });
+  // keep the whole menu on screen
+  useEffect(() => {
+    const r = ref.current?.getBoundingClientRect();
+    if (!r) return;
+    setPos({
+      x: Math.max(4, Math.min(x, window.innerWidth - r.width - 8)),
+      y: Math.max(4, Math.min(y, window.innerHeight - r.height - 8)),
+    });
+  }, [x, y]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <>
+      <div
+        style={S.dropdownScrim}
+        onClick={onClose}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onClose();
+        }}
+      />
+      <div
+        ref={ref}
+        style={{ ...S.menu, left: pos.x, top: pos.y }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {entries.map((m, i) =>
+          m.sep ? (
+            <div key={i} style={S.menuSep} />
+          ) : (
+            <button
+              key={i}
+              style={{
+                ...S.menuItem,
+                ...(m.disabled ? S.menuItemDisabled : null),
+                ...(m.danger && !m.disabled ? { color: C.danger } : null),
+              }}
+              disabled={m.disabled}
+              onClick={() => {
+                onClose();
+                m.onClick?.();
+              }}
+            >
+              <span style={{ flex: 1 }}>{m.label}</span>
+              {m.hint && <span style={S.menuHint}>{m.hint}</span>}
+            </button>
+          ),
+        )}
+      </div>
+    </>
+  );
+}
+
+interface PromptDialogProps {
+  title: string;
+  label: string;
+  initial: string;
+  submitLabel: string;
+  /** throw / reject to show the error inline and keep the dialog open */
+  onSubmit: (value: string) => Promise<void> | void;
+  onClose: () => void;
+}
+
+function PromptDialog(p: PromptDialogProps) {
+  const [value, setValue] = useState(p.initial);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.focus();
+    // select the stem, not the extension — like Explorer's rename
+    const dot = p.initial.lastIndexOf(".");
+    el.setSelectionRange(0, dot > 0 ? dot : p.initial.length);
+  }, [p.initial]);
+  const submit = async () => {
+    const v = value.trim();
+    if (!v || v === p.initial) return p.onClose();
+    setBusy(true);
+    setError(null);
+    try {
+      await p.onSubmit(v);
+      p.onClose();
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  };
+  return (
+    <div style={S.viewerBackdrop} onClick={busy ? undefined : p.onClose}>
+      <div style={{ ...S.modal, width: 440 }} onClick={(e) => e.stopPropagation()}>
+        <div style={S.modalHeader}>
+          <span style={{ flex: 1, fontWeight: 600 }}>{p.title}</span>
+        </div>
+        <div style={{ padding: 14, display: "flex", flexDirection: "column", gap: 8 }}>
+          <label style={{ fontSize: 12, color: C.textDim }}>{p.label}</label>
+          <input
+            ref={inputRef}
+            style={S.dialogInput}
+            value={value}
+            spellCheck={false}
+            disabled={busy}
+            onChange={(e) => setValue(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") submit();
+              else if (e.key === "Escape") p.onClose();
+            }}
+          />
+          {error && <div style={{ color: C.danger, fontSize: 12 }}>{error}</div>}
+        </div>
+        <div style={S.modalFooter}>
+          <button style={S.ghostBtn} onClick={p.onClose} disabled={busy}>
+            취소
+          </button>
+          <button style={S.primaryBtn} onClick={submit} disabled={busy || !value.trim()}>
+            {p.submitLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface ConfirmDialogProps {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  onConfirm: () => Promise<void> | void;
+  onClose: () => void;
+}
+
+function ConfirmDialog(p: ConfirmDialogProps) {
+  const [busy, setBusy] = useState(false);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => btnRef.current?.focus(), []);
+  const go = async () => {
+    setBusy(true);
+    try {
+      await p.onConfirm();
+    } finally {
+      p.onClose();
+    }
+  };
+  return (
+    <div style={S.viewerBackdrop} onClick={busy ? undefined : p.onClose}>
+      <div style={{ ...S.modal, width: 440 }} onClick={(e) => e.stopPropagation()}>
+        <div style={S.modalHeader}>
+          <span style={{ flex: 1, fontWeight: 600 }}>{p.title}</span>
+        </div>
+        <div style={{ padding: 14, fontSize: 13, color: C.textDim, whiteSpace: "pre-line" }}>
+          {p.message}
+        </div>
+        <div style={S.modalFooter}>
+          <button style={S.ghostBtn} onClick={p.onClose} disabled={busy}>
+            취소
+          </button>
+          <button
+            ref={btnRef}
+            style={{ ...S.primaryBtn, background: C.danger, color: "#fff" }}
+            onClick={go}
+            disabled={busy}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") p.onClose();
+            }}
+          >
+            {p.confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Batch convert dialog
 // ---------------------------------------------------------------------------
 
@@ -2352,6 +2918,73 @@ const S: Record<string, CSSProperties> = {
     whiteSpace: "nowrap",
   },
   dropdownScrim: { position: "fixed", inset: 0, zIndex: 40 },
+  // right-click file menu
+  menu: {
+    position: "fixed",
+    minWidth: 220,
+    background: C.panelAlt,
+    border: `1px solid ${C.border}`,
+    borderRadius: 8,
+    boxShadow: "0 12px 40px rgba(0,0,0,0.5)",
+    padding: 4,
+    zIndex: 50,
+    display: "flex",
+    flexDirection: "column",
+  },
+  menuItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    width: "100%",
+    background: "transparent",
+    border: "none",
+    color: C.text,
+    padding: "7px 10px",
+    borderRadius: 6,
+    cursor: "pointer",
+    textAlign: "left",
+    fontSize: 12,
+  },
+  menuItemDisabled: { color: C.textFaint, cursor: "default" },
+  folderTile: {
+    position: "absolute",
+    inset: 0,
+    display: "grid",
+    placeItems: "center",
+    fontSize: 44,
+    background: C.panelAlt,
+    userSelect: "none",
+  },
+  menuSep: { height: 1, background: C.borderSoft, margin: "4px 6px" },
+  menuHint: { fontFamily: MONO, fontSize: 10, color: C.textFaint },
+  dialogInput: {
+    width: "100%",
+    background: C.panel,
+    border: `1px solid ${C.accent}`,
+    borderRadius: 6,
+    outline: "none",
+    color: C.text,
+    fontFamily: MONO,
+    fontSize: 13,
+    padding: "7px 9px",
+  },
+  toast: {
+    position: "fixed",
+    left: "50%",
+    bottom: 40,
+    transform: "translateX(-50%)",
+    maxWidth: "70vw",
+    background: C.panelAlt,
+    border: `1px solid ${C.border}`,
+    borderRadius: 8,
+    boxShadow: "0 12px 40px rgba(0,0,0,0.5)",
+    padding: "9px 14px",
+    fontSize: 12,
+    color: C.text,
+    zIndex: 120,
+    whiteSpace: "pre-line",
+  },
+  toastError: { borderColor: C.danger, color: C.danger },
   dropdown: {
     position: "absolute",
     top: "calc(100% + 4px)",

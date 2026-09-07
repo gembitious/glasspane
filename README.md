@@ -82,6 +82,9 @@ want a slightly smaller binary.
 | `Shift` + click | Select a range |
 | `Ctrl/Cmd` + `A` | Select all |
 | `Enter` / `F` | Open the active image fullscreen |
+| `F2` | Rename the active image |
+| `Delete` | Move the selection to the recycle bin (asks first) |
+| right-click | File menu: open with default app, reveal, rename, move to…, new folder, delete |
 
 **Fullscreen viewer:** the scroll **wheel pages** prev/next (`←`/`→`/`Home`/`End` also navigate,
 `Esc` closes). Zoom with **`Ctrl`+wheel** or `+`/`-`; `0` or double-click resets; drag to pan.
@@ -98,6 +101,14 @@ remembered. It stops by itself on the last image.
   `.zip`/`.cbz` path and jump there; `↑` goes to the parent folder (even above the current root).
 - **Drag and drop** a folder or `.zip`/`.cbz` onto the window to open it.
 - **Copy path** of the selected image from the preview panel.
+- **Browses like a file manager.** The grid shows subfolders and `.zip`/`.cbz` archives as tiles
+  (first), then images; double-click / `Enter` opens a folder or archive in place. Only images
+  open in the fullscreen viewer.
+- **Explorer basics on real files** — right-click a tile, a tree node, or the empty grid for: open
+  (folders/archives), open with the default app, reveal in the file manager, rename (`F2`), move to
+  another folder, new folder, and delete to the **recycle bin** (`Delete`, confirmed first). Works
+  on folders and archive files too; multi-selections move/delete together. Nothing ever overwrites
+  an existing file, and images inside `.zip`/`.cbz` stay read-only.
 - **Last position is remembered per folder/archive** — come back and the same image is selected
   with the grid scrolled to it. Paging in the fullscreen viewer moves that selection too, so
   closing the viewer lands on the page you were reading.

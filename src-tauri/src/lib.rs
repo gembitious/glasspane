@@ -1,6 +1,7 @@
 #[cfg(feature = "avif")]
 mod avif;
 mod convert;
+mod fsops;
 mod imaging;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -21,7 +22,12 @@ pub fn run() {
             imaging::list_archive,
             imaging::image_meta,
             imaging::reveal_in_explorer,
-            convert::convert_images
+            convert::convert_images,
+            fsops::trash_paths,
+            fsops::rename_path,
+            fsops::move_paths,
+            fsops::create_dir,
+            fsops::open_with_default
         ])
         .run(tauri::generate_context!())
         .expect("error while running glasspane");

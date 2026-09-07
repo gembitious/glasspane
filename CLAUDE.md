@@ -131,6 +131,11 @@ packaging (release build verified + `.github/workflows/release.yml` via `tauri-a
   `Progress = { done, total, name }` over the channel as each file completes.
   `ConvertOpts = { format: "jpg"|"png"|"webp", destDir, quality?, overwrite? }`
   (JPEG honors `quality`; PNG/WebP are lossless). `ConvertReport = { ok, failed: [{name, error}], outputs }`.
+- **Explorer-style file ops** (in `fsops.rs`; real filesystem paths only — the UI never sends
+  zip entries, archives stay read-only; nothing overwrites an existing file):
+  `trash_paths(paths) -> FsReport` (OS recycle bin), `rename_path(path, newName) -> newPath`,
+  `move_paths(paths, destDir) -> FsReport`, `create_dir(parent, name) -> newPath`,
+  `open_with_default(path) -> ()`. `FsReport = { ok, failed: [{path, error}] }`.
 - `Src = { archive?: string, path: string }` — if `archive` is set, `path` is the **entry name
   inside that zip**; otherwise `path` is a **filesystem path**.
 
@@ -233,7 +238,12 @@ for real backend calls**. Feature list (so it can be rebuilt if ever needed):
   right collapsible **preview panel**. Plus a titlebar, two toolbar rows, and a status bar.
   Dark "developer-tool" aesthetic; JetBrains Mono for filenames/numbers.
 - **Tree:** folders and zips shown together; zips expand/behave like folders. Selecting a node
-  loads its images into the grid. Item counts shown per node.
+  loads its images into the grid. Item counts shown per node. Right-click a node for the file
+  menu (rename / move / new folder / recycle bin / open with default app / reveal).
+- **Grid entries are Explorer-like:** a folder node's grid shows its subfolders and archives as
+  icon tiles (sorted first), then images; double-click / `Enter` on a folder or archive tile
+  navigates into it, only images open the viewer. Those tiles get the same file menu. Images
+  inside an archive are read-only (menu shows only "reveal").
 - **Virtualized grid (manual, no library):** compute column count from container width and tile
   size; render only the visible rows plus a small overscan; absolute-position tiles inside a
   spacer sized to the full height. Tile = thumbnail + filename + format badge (webp/avif
